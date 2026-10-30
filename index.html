@@ -1,0 +1,3101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>TILT - 3D Marble Labyrinth</title>
+  <!--
+  ================================================================================
+  TILT - 3D LOW-POLY MARBLE LABYRINTH
+  ================================================================================
+  ARCHITECTURE & DESIGN README
+
+  1. PHYSICS ENGINE APPROACH:
+     - Coordinate Systems:
+       The floating island group sits at the world origin (0,0,0) and rotates around
+       X and Z axes within clamped limits (max ±25° or ±0.4363 rad).
+       World gravity is permanently fixed downwards: g_world = (0, -28.0, 0).
+       The marble is simulated in the Island's Local Coordinate Frame. Local gravity
+       is computed each frame by transforming world gravity into island local space:
+           g_local = Q_island^(-1) * g_world
+       This naturally pulls the marble down whichever incline the island tilts,
+       providing true mechanical labyrinth physics with exact Newtonian acceleration.
+     
+     - Deterministic 60 Hz Fixed Timestep:
+       A fixed accumulator loop runs at 1/60s (approx 16.67ms). Rendering interpolates
+       or steps synchronously. A seeded PRNG (Mulberry32) guarantees 100% determinism
+       for identical input sequences across runs and the Daily Island generator.
+     
+     - Swept Sphere Collision Resolution:
+       To prevent high-velocity tunneling through thin edges or ramp seams, physics
+       runs with 2 sub-steps per frame (dt/2). Each sub-step performs:
+       a) Sphere vs AABB/Box: Clamps marble center to box bounds [min, max] to find
+          closest point C. If distance d < R, resolves normal penetration (R - d),
+          applies normal impulse with restitution (e=0.22), and computes tangential
+          Coulomb rolling friction (mu=0.96). If normal points mostly up (ny > 0.6),
+          the marble is marked as grounded.
+       b) Sphere vs Ramp (Sloped Wedges): Projects footprint onto inclined ramp plane,
+          detecting contact along the ramp's true slope normal.
+       c) Moving Hazards: Blocks oscillate with parametric velocities that are transferred
+          as momentum impulses to the marble upon collision.
+       d) Spinning Bars: Oriented box check with angular tangential velocity (omega x r)
+          delivering outward centrifugal swat impulses.
+       e) Crumbling Tiles: Trigger shake timers on contact before detaching and falling.
+       f) Reverse-Tilt Zones: Trigger volumes that invert user tilt axes.
+
+  2. GHOST COMPRESSION CODEC:
+     - Tilt inputs (X, Z) are sampled every physics frame, normalized, and quantized
+       to signed 8-bit integers [-127, 127].
+     - Trajectory keyframes (position & orientation) are captured every 6 frames (10 Hz).
+     - Delta encoding: dX = X[t] - X[t-1], dZ = Z[t] - Z[t-1].
+     - Run-Length Encoding (RLE): Repeating delta runs are compressed as (count, dX, dZ).
+     - The byte buffer is converted to a URL-safe Base64 share code string that can
+       be copied, shared, or stored.
+     - When replayed, a secondary translucent holographic ghost marble races alongside!
+
+  3. MULTIPLAYER BACKEND INTEGRATION:
+     - The game uses an abstraction layer (`MultiplayerAPI`) that defaults to localStorage.
+     - Marked hooks indicate where to plug in a REST API or WebSocket service:
+       * `saveRun(levelId, runData)` -> POST /api/runs
+       * `loadRuns(levelId)` -> GET /api/runs/:levelId
+       * `fetchLeaderboard(levelId)` -> GET /api/leaderboard/:levelId
+     - Live Duel Mode (WebRTC):
+       Two players connect via an `RTCPeerConnection` with an `RTCDataChannel`.
+       Inputs are split: Player 1 controls the X-axis tilt (Left/Right), while
+       Player 2 controls the Z-axis tilt (Forward/Back). Lightweight input packets
+       are sent across the data channel at 60Hz.
+
+  4. POTATO PC OPTIMIZATIONS:
+     - Flat-shaded MeshLambertMaterial with vertex colors.
+     - All static boxes, ramps, and platforms in a level are pre-merged into a
+       SINGLE BufferGeometry, reducing level rendering to 1 draw call!
+     - Total scene triangles remain well under 2,000.
+     - Capped device pixel ratio (max 1.0).
+     - Quality modes: 100%, 75%, 50% render scale, and "Potato Mode" (disables fog,
+       drops particles, minimum scale).
+     - Particle trail uses a pre-allocated fixed pool of 40 points (zero garbage collection).
+     - Pre-allocated reusable scratch Vector3/Euler/Quaternion math objects.
+     - Pauses rendering when document.hidden is true.
+  ================================================================================
+  -->
+  <style>
+    :root {
+      --bg-sky: #1c182b;
+      --card-bg: rgba(28, 24, 43, 0.88);
+      --card-border: rgba(255, 255, 255, 0.12);
+      --accent-cyan: #00f0ff;
+      --accent-gold: #ffd152;
+      --accent-magenta: #ff3377;
+      --accent-green: #2ecc71;
+      --text-main: #f0f3fa;
+      --text-dim: #9aa3bc;
+      --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: var(--bg-sky);
+      font-family: var(--font-stack);
+      color: var(--text-main);
+    }
+
+    #game-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    #game-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      outline: none;
+      touch-action: none;
+    }
+
+    /* HUD Overlay */
+    #hud {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 18px 24px;
+      z-index: 10;
+    }
+
+    .hud-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      width: 100%;
+    }
+
+    .hud-level-info {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      text-shadow: 0 2px 8px rgba(0,0,0,0.7);
+    }
+
+    .level-badge {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--accent-cyan);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .level-badge .indicator {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-cyan);
+      box-shadow: 0 0 8px var(--accent-cyan);
+    }
+
+    .level-title {
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+
+    .hud-stats {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      background: var(--card-bg);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--card-border);
+      border-radius: 30px;
+      padding: 8px 18px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    }
+
+    .stat-timer {
+      font-family: "SF Mono", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+      font-size: 20px;
+      font-weight: 700;
+      color: #ffffff;
+      min-width: 90px;
+      text-align: center;
+    }
+
+    .stat-stars {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .star-icon {
+      width: 20px;
+      height: 20px;
+      fill: rgba(255, 255, 255, 0.2);
+      transition: fill 0.2s ease, transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    .star-icon.collected {
+      fill: var(--accent-gold);
+      filter: drop-shadow(0 0 6px rgba(255, 209, 82, 0.8));
+      transform: scale(1.15);
+    }
+
+    .hud-buttons {
+      display: flex;
+      gap: 8px;
+      pointer-events: auto;
+    }
+
+    .icon-btn {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+      transition: all 0.15s ease;
+    }
+
+    .icon-btn:hover {
+      background: rgba(255, 255, 255, 0.18);
+      transform: translateY(-2px);
+      border-color: var(--accent-cyan);
+    }
+
+    .icon-btn:active {
+      transform: translateY(0);
+    }
+
+    .icon-btn svg {
+      width: 20px;
+      height: 20px;
+      fill: currentColor;
+    }
+
+    /* Status Notifications / Badges */
+    .hud-alerts {
+      position: absolute;
+      top: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: center;
+      pointer-events: none;
+    }
+
+    .alert-pill {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      padding: 6px 16px;
+      border-radius: 20px;
+      background: rgba(0,0,0,0.7);
+      backdrop-filter: blur(6px);
+      border: 1px solid rgba(255,255,255,0.2);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      opacity: 0;
+      transform: translateY(-10px);
+      transition: opacity 0.25s ease, transform 0.25s ease;
+    }
+
+    .alert-pill.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .alert-pill.reverse {
+      border-color: var(--accent-magenta);
+      color: var(--accent-magenta);
+      box-shadow: 0 0 16px rgba(255, 51, 119, 0.4);
+      animation: pulseAlert 1s infinite alternate ease-in-out;
+    }
+
+    .alert-pill.slowmo {
+      border-color: var(--accent-cyan);
+      color: var(--accent-cyan);
+    }
+
+    .alert-pill.magnet {
+      border-color: var(--accent-gold);
+      color: var(--accent-gold);
+    }
+
+    .alert-pill.checkpoint {
+      border-color: var(--accent-green);
+      color: var(--accent-green);
+    }
+
+    @keyframes pulseAlert {
+      from { transform: scale(1); }
+      to { transform: scale(1.06); }
+    }
+
+    /* Mobile Tilt Helper & Indicator */
+    .hud-bottom {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      width: 100%;
+    }
+
+    .tilt-bubble {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: rgba(28, 24, 43, 0.5);
+      border: 2px solid rgba(255, 255, 255, 0.15);
+      position: relative;
+      pointer-events: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .tilt-bubble-dot {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent-cyan);
+      box-shadow: 0 0 10px var(--accent-cyan);
+      position: absolute;
+      transform: translate(0, 0);
+      transition: transform 0.05s ease-out;
+    }
+
+    .tilt-bubble-cross {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      opacity: 0.2;
+    }
+
+    .controls-hint {
+      font-size: 11px;
+      color: var(--text-dim);
+      background: rgba(0, 0, 0, 0.4);
+      padding: 6px 14px;
+      border-radius: 14px;
+      backdrop-filter: blur(4px);
+    }
+
+    /* Modals & Overlays */
+    .modal-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(13, 11, 20, 0.78);
+      backdrop-filter: blur(12px);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s ease;
+    }
+
+    .modal-overlay.active {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .modal-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 24px;
+      width: 100%;
+      max-width: 580px;
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+      transform: scale(0.95);
+      transition: transform 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    .modal-overlay.active .modal-card {
+      transform: scale(1);
+    }
+
+    .modal-header {
+      padding: 22px 28px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--card-border);
+    }
+
+    .modal-title {
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+
+    .modal-body {
+      padding: 24px 28px;
+      overflow-y: auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .modal-footer {
+      padding: 16px 28px 22px;
+      border-top: 1px solid var(--card-border);
+      display: flex;
+      justify-content: flex-end;
+      gap: 12px;
+    }
+
+    .btn {
+      padding: 10px 22px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .btn-primary {
+      background: var(--accent-cyan);
+      color: #0c101c;
+      box-shadow: 0 4px 16px rgba(0, 240, 255, 0.35);
+    }
+
+    .btn-primary:hover {
+      background: #4df5ff;
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text-main);
+      border: 1px solid var(--card-border);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.18);
+    }
+
+    /* Level Select Grid */
+    .level-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 12px;
+    }
+
+    .level-card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 14px 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .level-card:hover {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: var(--accent-cyan);
+      transform: translateY(-2px);
+    }
+
+    .level-card.active {
+      border-color: var(--accent-cyan);
+      background: rgba(0, 240, 255, 0.12);
+    }
+
+    .level-card .num {
+      font-size: 20px;
+      font-weight: 800;
+    }
+
+    .level-card .stars {
+      display: flex;
+      gap: 2px;
+    }
+
+    .level-card .stars svg {
+      width: 13px;
+      height: 13px;
+      fill: rgba(255, 255, 255, 0.2);
+    }
+
+    .level-card .stars svg.earned {
+      fill: var(--accent-gold);
+    }
+
+    .level-card .best-time {
+      font-size: 10px;
+      font-family: monospace;
+      color: var(--text-dim);
+    }
+
+    .daily-island-banner {
+      background: linear-gradient(135deg, rgba(255, 209, 82, 0.15), rgba(255, 51, 119, 0.15));
+      border: 1px solid rgba(255, 209, 82, 0.4);
+      border-radius: 16px;
+      padding: 16px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .daily-island-banner:hover {
+      border-color: var(--accent-gold);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(255, 209, 82, 0.2);
+    }
+
+    .daily-title {
+      font-size: 16px;
+      font-weight: 800;
+      color: var(--accent-gold);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .daily-date {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+
+    /* Victory Modal Elements */
+    .victory-stars {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin: 10px 0;
+    }
+
+    .victory-stars svg {
+      width: 44px;
+      height: 44px;
+      fill: rgba(255, 255, 255, 0.15);
+      transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), fill 0.3s;
+    }
+
+    .victory-stars svg.awarded {
+      fill: var(--accent-gold);
+      filter: drop-shadow(0 0 12px rgba(255, 209, 82, 0.9));
+      transform: scale(1.25) rotate(12deg);
+    }
+
+    .victory-time-box {
+      background: rgba(0,0,0,0.3);
+      border-radius: 14px;
+      padding: 14px;
+      text-align: center;
+    }
+
+    .victory-time-val {
+      font-family: monospace;
+      font-size: 32px;
+      font-weight: 800;
+      color: #fff;
+    }
+
+    .victory-medal-text {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent-gold);
+      margin-top: 4px;
+      letter-spacing: 1px;
+    }
+
+    /* Form Controls for Settings */
+    .setting-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .setting-label {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .setting-desc {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+
+    .select-input, .text-input {
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: #fff;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+    }
+
+    .select-input:focus, .text-input:focus {
+      border-color: var(--accent-cyan);
+    }
+
+    /* Duel Modal Styling */
+    .duel-tabs {
+      display: flex;
+      gap: 8px;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 12px;
+    }
+
+    .duel-tab-btn {
+      padding: 6px 14px;
+      border-radius: 8px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .duel-tab-btn.active {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border-color: var(--card-border);
+    }
+
+    .duel-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .code-area {
+      width: 100%;
+      height: 70px;
+      background: rgba(0, 0, 0, 0.5);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: #fff;
+      font-family: monospace;
+      font-size: 11px;
+      padding: 8px;
+      resize: none;
+      word-break: break-all;
+    }
+
+    /* Mobile / Touch Responsive */
+    @media (max-width: 600px) {
+      #hud {
+        padding: 12px 14px;
+      }
+      .level-title {
+        font-size: 18px;
+      }
+      .hud-stats {
+        padding: 6px 12px;
+        gap: 12px;
+      }
+      .stat-timer {
+        font-size: 16px;
+        min-width: 72px;
+      }
+      .modal-card {
+        max-height: 94vh;
+      }
+      .modal-header {
+        padding: 16px 20px;
+      }
+      .modal-body {
+        padding: 16px 20px;
+      }
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+  <div id="game-container">
+    <canvas id="game-canvas"></canvas>
+
+    <!-- HUD Overlay -->
+    <div id="hud">
+      <div class="hud-top">
+        <div class="hud-level-info">
+          <div class="level-badge">
+            <span class="indicator"></span>
+            <span id="hud-level-badge-text">STAGE 01</span>
+          </div>
+          <div class="level-title" id="hud-level-name">The First Tilt</div>
+        </div>
+
+        <div class="hud-stats">
+          <div class="stat-timer" id="hud-timer">00:00.00</div>
+          <div class="stat-stars">
+            <svg class="star-icon" id="hud-star-0" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+            <svg class="star-icon" id="hud-star-1" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+            <svg class="star-icon" id="hud-star-2" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+          </div>
+        </div>
+
+        <div class="hud-buttons">
+          <button class="icon-btn" id="btn-restart" title="Restart Level [R]">
+            <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          </button>
+          <button class="icon-btn" id="btn-levels" title="Level Select [L]">
+            <svg viewBox="0 0 24 24"><path d="M4 11h5V5H4v6zm0 7h5v-5H4v5zm6 0h5v-5h-5v5zm6 0h5v-5h-5v5zm-6-7h5V5h-5v6zm6-6v6h5V5h-5z"/></svg>
+          </button>
+          <button class="icon-btn" id="btn-duel" title="Multiplayer Duel & Ghost [G]">
+            <svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+          </button>
+          <button class="icon-btn" id="btn-settings" title="Settings [Esc]">
+            <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+          </button>
+          <button class="icon-btn" id="btn-audio" title="Toggle Sound [M]">
+            <svg id="audio-icon-on" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+            <svg id="audio-icon-off" style="display:none;" viewBox="0 0 24 24"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="hud-alerts">
+        <div class="alert-pill reverse" id="alert-reverse">REVERSE TILT ACTIVE</div>
+        <div class="alert-pill slowmo" id="alert-slowmo">TIME WARP (SLOW-MO)</div>
+        <div class="alert-pill magnet" id="alert-magnet">STAR MAGNET ENGAGED</div>
+        <div class="alert-pill checkpoint" id="alert-checkpoint">CHECKPOINT SAVED</div>
+      </div>
+
+      <div class="hud-bottom">
+        <div class="tilt-bubble" id="tilt-bubble">
+          <svg class="tilt-bubble-cross" viewBox="0 0 100 100">
+            <line x1="50" y1="10" x2="50" y2="90" stroke="#fff" stroke-width="1.5" stroke-dasharray="3,3"/>
+            <line x1="10" y1="50" x2="90" y2="50" stroke="#fff" stroke-width="1.5" stroke-dasharray="3,3"/>
+          </svg>
+          <div class="tilt-bubble-dot" id="tilt-bubble-dot"></div>
+        </div>
+        <div class="controls-hint">Mouse Drag / Move or WASD to Tilt Island • Space/R to Respawn</div>
+      </div>
+    </div>
+
+    <!-- Modal: Level Select -->
+    <div class="modal-overlay" id="modal-levels">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title">Select Island</div>
+          <button class="icon-btn modal-close" data-modal="modal-levels">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="daily-island-banner" id="btn-select-daily">
+            <div>
+              <div class="daily-title">
+                <svg style="width:18px;height:18px;fill:currentColor" viewBox="0 0 24 24"><path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11zM7 10h5v5H7z"/></svg>
+                Daily Island Challenge
+              </div>
+              <div class="daily-date" id="daily-island-date-label">Procedurally generated for today</div>
+            </div>
+            <div class="btn btn-primary" style="padding:6px 14px; font-size:12px;">Play Daily</div>
+          </div>
+
+          <div style="font-size:12px; font-weight:700; color:var(--text-dim); letter-spacing:1px; margin-top:6px;">HANDCRAFTED CAMPAIGN</div>
+          <div class="level-grid" id="level-grid-container">
+            <!-- Populated via JavaScript -->
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary modal-close" data-modal="modal-levels">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Victory / Level Complete -->
+    <div class="modal-overlay" id="modal-victory">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title" id="victory-title">Island Cleared!</div>
+        </div>
+        <div class="modal-body">
+          <div class="victory-stars">
+            <svg id="v-star-0" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+            <svg id="v-star-1" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+            <svg id="v-star-2" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+          </div>
+
+          <div class="victory-time-box">
+            <div style="font-size:11px; text-transform:uppercase; color:var(--text-dim); letter-spacing:1.5px;">Completion Time</div>
+            <div class="victory-time-val" id="victory-time-text">00:14.28</div>
+            <div class="victory-medal-text" id="victory-medal-text">🏆 GOLD MEDAL</div>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div style="font-size:12px; color:var(--text-dim);">Share Run Replay Code:</div>
+            <div style="display:flex; gap:8px;">
+              <input type="text" class="text-input" id="victory-ghost-code" readonly style="flex:1; font-family:monospace; font-size:11px;">
+              <button class="btn btn-secondary" id="btn-copy-ghost">Copy</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btn-victory-replay">Replay</button>
+          <button class="btn btn-primary" id="btn-victory-next">Next Island</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Settings & Quality -->
+    <div class="modal-overlay" id="modal-settings">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title">Settings & Performance</div>
+          <button class="icon-btn modal-close" data-modal="modal-settings">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Render Resolution</div>
+              <div class="setting-desc">Lower resolution runs faster on integrated GPUs</div>
+            </div>
+            <select class="select-input" id="opt-resolution">
+              <option value="1.0">100% (Native)</option>
+              <option value="0.75" selected>75% (Balanced)</option>
+              <option value="0.5">50% (High Speed)</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Potato PC Mode</div>
+              <div class="setting-desc">Disables fog, drops particles, minimal overhead</div>
+            </div>
+            <input type="checkbox" id="opt-potato">
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Control Mode</div>
+              <div class="setting-desc">Choose primary control method</div>
+            </div>
+            <select class="select-input" id="opt-controls">
+              <option value="auto" selected>Auto (WASD / Arrows + Mouse Drag + Touch)</option>
+              <option value="pointer">Mouse Position (Hover Tilt)</option>
+              <option value="drag">Mouse Drag (Click & Pull)</option>
+              <option value="keys">Keyboard Only (WASD / Arrows)</option>
+              <option value="gyro">Device Gyroscope (Mobile)</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Sound Volume</div>
+              <div class="setting-desc">Procedural WebAudio synthesizer</div>
+            </div>
+            <input type="range" id="opt-volume" min="0" max="1" step="0.05" value="0.7" style="accent-color:var(--accent-cyan); width:120px;">
+          </div>
+
+          <div style="margin-top:10px;">
+            <div style="font-size:13px; font-weight:700; margin-bottom:6px;">Import Ghost Replay String</div>
+            <div style="display:flex; gap:8px;">
+              <input type="text" class="text-input" id="input-import-ghost" placeholder="Paste ghost code here..." style="flex:1; font-family:monospace; font-size:11px;">
+              <button class="btn btn-secondary" id="btn-import-ghost">Load Ghost</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary modal-close" data-modal="modal-settings">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: WebRTC Live Duel & Ghost -->
+    <div class="modal-overlay" id="modal-duel">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title">Live Axis Duel (WebRTC)</div>
+          <button class="icon-btn modal-close" data-modal="modal-duel">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size:12px; color:var(--text-dim); line-height:1.5;">
+            In Live Duel mode, two players cooperatively control the tilt! <strong>Player 1 controls the X-Axis</strong> (Left / Right) and <strong>Player 2 controls the Z-Axis</strong> (Forward / Backward). Data transmits via direct peer-to-peer WebRTC DataChannels.
+          </p>
+
+          <div class="duel-tabs">
+            <button class="duel-tab-btn active" id="tab-duel-host">Host Duel (P1: X-Axis)</button>
+            <button class="duel-tab-btn" id="tab-duel-join">Join Duel (P2: Z-Axis)</button>
+            <button class="duel-tab-btn" id="tab-duel-local">Local Shared Test</button>
+          </div>
+
+          <!-- Host Pane -->
+          <div id="pane-duel-host" class="duel-box">
+            <div style="font-size:12px;">Step 1: Generate & Copy Offer to send to Player 2:</div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-secondary" id="btn-webrtc-create-offer">Create Offer Code</button>
+              <button class="btn btn-secondary" id="btn-webrtc-copy-offer">Copy</button>
+            </div>
+            <textarea class="code-area" id="webrtc-offer-out" readonly placeholder="Click 'Create Offer Code' above..."></textarea>
+            
+            <div style="font-size:12px; margin-top:8px;">Step 2: Paste Answer from Player 2:</div>
+            <textarea class="code-area" id="webrtc-answer-in" placeholder="Paste Player 2's answer code here..."></textarea>
+            <button class="btn btn-primary" id="btn-webrtc-connect">Finalize Connection</button>
+          </div>
+
+          <!-- Join Pane -->
+          <div id="pane-duel-join" class="duel-box" style="display:none;">
+            <div style="font-size:12px;">Step 1: Paste Offer from Host (Player 1):</div>
+            <textarea class="code-area" id="webrtc-offer-in" placeholder="Paste Player 1's offer code here..."></textarea>
+            <button class="btn btn-secondary" id="btn-webrtc-create-answer">Generate Answer Code</button>
+
+            <div style="font-size:12px; margin-top:8px;">Step 2: Copy & Send Answer back to Host:</div>
+            <textarea class="code-area" id="webrtc-answer-out" readonly placeholder="Answer will appear here..."></textarea>
+            <button class="btn btn-primary" id="btn-webrtc-copy-answer">Copy Answer Code</button>
+          </div>
+
+          <!-- Local Split Test Pane -->
+          <div id="pane-duel-local" class="duel-box" style="display:none;">
+            <div style="font-size:13px; font-weight:700;">Local Split-Axis Practice:</div>
+            <p style="font-size:12px; color:var(--text-dim); line-height:1.4;">
+              Test the split-axis mechanics on a single device! <strong>P1 uses A and D keys</strong> (X tilt), while <strong>P2 uses W and S keys or Up/Down arrows</strong> (Z tilt).
+            </p>
+            <button class="btn btn-primary" id="btn-toggle-local-duel">Enable Local Split-Axis Mode</button>
+          </div>
+
+          <div id="webrtc-status" style="font-size:12px; font-weight:700; color:var(--accent-cyan); text-align:center; padding:4px;">
+            Status: Standalone Mode
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary modal-close" data-modal="modal-duel">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    'use strict';
+    /* =========================================================================
+       TILT - SINGLE-FILE 3D ENGINE & GAME LOGIC
+       ========================================================================= */
+
+    // --- Deterministic PRNG (Mulberry32) ---
+    class PRNG {
+      constructor(seed = 12345678) {
+        this.s = seed >>> 0;
+      }
+      next() {
+        var t = this.s += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      }
+      range(min, max) {
+        return min + this.next() * (max - min);
+      }
+      choose(arr) {
+        return arr[Math.floor(this.next() * arr.length)];
+      }
+    }
+
+    // Hash date string YYYY-MM-DD into uint32 seed
+    function hashDateSeed(dateStr) {
+      let hash = 2166136261;
+      for (let i = 0; i < dateStr.length; i++) {
+        hash ^= dateStr.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return hash >>> 0;
+    }
+
+    // --- Procedural WebAudio Synthesizer ---
+    class SoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.masterGain = null;
+        this.isMuted = false;
+        this.volume = 0.7;
+
+        // Rolling sound node references
+        this.rollingOsc = null;
+        this.rollingFilter = null;
+        this.rollingGain = null;
+        this.initialized = false;
+      }
+
+      init() {
+        if (this.initialized) return;
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        this.ctx = new AudioContext();
+
+        this.masterGain = this.ctx.createGain();
+        this.masterGain.gain.setValueAtTime(this.isMuted ? 0 : this.volume, this.ctx.currentTime);
+        this.masterGain.connect(this.ctx.destination);
+
+        // Setup rolling hum oscillator
+        this.rollingOsc = this.ctx.createOscillator();
+        this.rollingOsc.type = 'triangle';
+        this.rollingOsc.frequency.setValueAtTime(60, this.ctx.currentTime);
+
+        this.rollingFilter = this.ctx.createBiquadFilter();
+        this.rollingFilter.type = 'lowpass';
+        this.rollingFilter.frequency.setValueAtTime(140, this.ctx.currentTime);
+
+        this.rollingGain = this.ctx.createGain();
+        this.rollingGain.gain.setValueAtTime(0.0001, this.ctx.currentTime);
+
+        this.rollingOsc.connect(this.rollingFilter);
+        this.rollingFilter.connect(this.rollingGain);
+        this.rollingGain.connect(this.masterGain);
+        this.rollingOsc.start();
+
+        this.initialized = true;
+      }
+
+      ensureActive() {
+        if (!this.initialized) {
+          this.init();
+        } else if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx.resume();
+        }
+      }
+
+      setMute(mute) {
+        this.isMuted = mute;
+        if (this.masterGain && this.ctx) {
+          this.masterGain.gain.setValueAtTime(mute ? 0 : this.volume, this.ctx.currentTime);
+        }
+      }
+
+      setVolume(val) {
+        this.volume = Math.max(0, Math.min(1, val));
+        if (this.masterGain && this.ctx && !this.isMuted) {
+          this.masterGain.gain.setValueAtTime(this.volume, this.ctx.currentTime);
+        }
+      }
+
+      updateRolling(speed, isGrounded) {
+        if (!this.initialized || !this.rollingGain || this.isMuted) return;
+        const now = this.ctx.currentTime;
+        if (!isGrounded || speed < 0.2) {
+          this.rollingGain.gain.setTargetAtTime(0.0001, now, 0.05);
+        } else {
+          const targetGain = Math.min(0.22, (speed / 18.0) * 0.22);
+          const targetFreq = 50 + Math.min(180, speed * 12);
+          const targetCutoff = 120 + Math.min(600, speed * 35);
+          this.rollingGain.gain.setTargetAtTime(targetGain, now, 0.04);
+          this.rollingOsc.frequency.setTargetAtTime(targetFreq, now, 0.04);
+          this.rollingFilter.frequency.setTargetAtTime(targetCutoff, now, 0.04);
+        }
+      }
+
+      playBounce(velocity) {
+        if (!this.initialized || this.isMuted) return;
+        const speed = Math.min(25, velocity);
+        if (speed < 1.0) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(90 + speed * 6, now);
+        osc.frequency.exponentialRampToValueAtTime(30, now + 0.06);
+        const amp = Math.min(0.3, speed * 0.02);
+        gain.gain.setValueAtTime(amp, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+        osc.connect(gain);
+        gain.connect(this.masterGain);
+        osc.start(now);
+        osc.stop(now + 0.07);
+      }
+
+      playChirp(notes, type = 'sine', duration = 0.08) {
+        if (!this.initialized || this.isMuted) return;
+        let t = this.ctx.currentTime;
+        notes.forEach((freq, idx) => {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, t);
+          gain.gain.setValueAtTime(0.18, t);
+          gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+          osc.connect(gain);
+          gain.connect(this.masterGain);
+          osc.start(t);
+          osc.stop(t + duration);
+          t += duration * 0.65;
+        });
+      }
+
+      playStar() {
+        this.playChirp([523.25, 659.25, 783.99, 1046.50], 'triangle', 0.07);
+      }
+
+      playSlowMo() {
+        if (!this.initialized || this.isMuted) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(660, now);
+        osc.frequency.exponentialRampToValueAtTime(160, now + 0.4);
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+        osc.connect(gain);
+        gain.connect(this.masterGain);
+        osc.start(now);
+        osc.stop(now + 0.42);
+      }
+
+      playMagnet() {
+        this.playChirp([440, 554.37, 659.25, 880], 'sine', 0.09);
+      }
+
+      playCheckpoint() {
+        this.playChirp([440, 659.25], 'triangle', 0.12);
+      }
+
+      playFall() {
+        if (!this.initialized || this.isMuted) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(280, now);
+        osc.frequency.exponentialRampToValueAtTime(45, now + 0.5);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+        osc.connect(gain);
+        gain.connect(this.masterGain);
+        osc.start(now);
+        osc.stop(now + 0.52);
+      }
+
+      playWin() {
+        this.playChirp([523.25, 659.25, 783.99, 1046.50, 1318.51], 'sine', 0.12);
+      }
+    }
+
+    const audio = new SoundEngine();
+
+    // --- Multiplayer / Ghost Replay Abstraction Layer ---
+    const MultiplayerAPI = {
+      // LocalStorage fallback default
+      saveRun: async (levelId, runData) => {
+        try {
+          const key = `tilt_best_${levelId}`;
+          const existing = localStorage.getItem(key);
+          let shouldSave = true;
+          if (existing) {
+            const parsed = JSON.parse(existing);
+            if (parsed.time <= runData.time && parsed.stars >= runData.stars) {
+              shouldSave = false;
+            }
+          }
+          if (shouldSave) {
+            localStorage.setItem(key, JSON.stringify(runData));
+          }
+          /*
+           * ==============================================================
+           * REST / WEBSOCKET BACKEND HOOK:
+           * To send runs to a dedicated server, replace or augment below:
+           * await fetch('/api/runs', {
+           *   method: 'POST',
+           *   headers: { 'Content-Type': 'application/json' },
+           *   body: JSON.stringify({ levelId, ...runData })
+           * });
+           * ==============================================================
+           */
+          return true;
+        } catch (e) {
+          console.warn('LocalStorage save failed', e);
+          return false;
+        }
+      },
+
+      loadRuns: async (levelId) => {
+        try {
+          const key = `tilt_best_${levelId}`;
+          const val = localStorage.getItem(key);
+          return val ? JSON.parse(val) : null;
+        } catch (e) {
+          return null;
+        }
+      },
+
+      // Compact Replay Encoding:
+      // Packs trajectory keyframes (sampled at 10Hz) into delta + base64url string
+      encodeGhost: (run) => {
+        try {
+          const kfs = run.keyframes; // array of [t, x, y, z]
+          if (!kfs || kfs.length === 0) return '';
+          const buffer = [];
+          // Header: levelId (1 byte), stars (1 byte), time (uint16 ms / 10)
+          buffer.push(run.levelId & 0xff);
+          buffer.push(run.stars & 0x03);
+          const timeScaled = Math.min(65535, Math.round(run.time * 100));
+          buffer.push((timeScaled >> 8) & 0xff);
+          buffer.push(timeScaled & 0xff);
+
+          // Position keyframes delta encoded
+          let lastX = 0, lastY = 0, lastZ = 0;
+          kfs.forEach(kf => {
+            const ix = Math.round(kf[1] * 20); // 0.05 precision
+            const iy = Math.round(kf[2] * 20);
+            const iz = Math.round(kf[3] * 20);
+            let dx = ix - lastX;
+            let dy = iy - lastY;
+            let dz = iz - lastZ;
+            // Clamp to signed 8-bit
+            dx = Math.max(-127, Math.min(127, dx));
+            dy = Math.max(-127, Math.min(127, dy));
+            dz = Math.max(-127, Math.min(127, dz));
+            buffer.push(dx & 0xff);
+            buffer.push(dy & 0xff);
+            buffer.push(dz & 0xff);
+            lastX += dx;
+            lastY += dy;
+            lastZ += dz;
+          });
+
+          // Base64 encode
+          let binary = '';
+          const bytes = new Uint8Array(buffer);
+          for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        } catch (e) {
+          console.error('Failed to encode ghost', e);
+          return '';
+        }
+      },
+
+      decodeGhost: (codeStr) => {
+        try {
+          if (!codeStr) return null;
+          let base64 = codeStr.replace(/-/g, '+').replace(/_/g, '/');
+          while (base64.length % 4) base64 += '=';
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          if (bytes.length < 4) return null;
+          const levelId = bytes[0];
+          const stars = bytes[1];
+          const time = ((bytes[2] << 8) | bytes[3]) / 100;
+
+          const keyframes = [];
+          let curX = 0, curY = 0, curZ = 0;
+          let ptr = 4;
+          let t = 0;
+          while (ptr + 2 < bytes.length) {
+            let dx = bytes[ptr++];
+            let dy = bytes[ptr++];
+            let dz = bytes[ptr++];
+            if (dx > 127) dx -= 256;
+            if (dy > 127) dy -= 256;
+            if (dz > 127) dz -= 256;
+            curX += dx;
+            curY += dy;
+            curZ += dz;
+            keyframes.push([t, curX / 20, curY / 20, curZ / 20]);
+            t += 0.1; // 10 Hz
+          }
+          return { levelId, stars, time, keyframes };
+        } catch (e) {
+          console.error('Failed to decode ghost', e);
+          return null;
+        }
+      }
+    };
+
+    // --- WebRTC Axis Duel Management ---
+    const DuelManager = {
+      peer: null,
+      channel: null,
+      isHost: false,
+      connected: false,
+      localSplitMode: false,
+      p1TiltX: 0,
+      p2TiltZ: 0,
+
+      initPeer: (isHost) => {
+        DuelManager.isHost = isHost;
+        const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        DuelManager.peer = new RTCPeerConnection(config);
+
+        if (isHost) {
+          DuelManager.channel = DuelManager.peer.createDataChannel('tilt_axis', { ordered: false, maxRetransmits: 0 });
+          DuelManager.setupChannel();
+        } else {
+          DuelManager.peer.ondatachannel = (e) => {
+            DuelManager.channel = e.channel;
+            DuelManager.setupChannel();
+          };
+        }
+
+        DuelManager.peer.oniceconnectionstatechange = () => {
+          const st = DuelManager.peer.iceConnectionState;
+          const label = document.getElementById('webrtc-status');
+          if (label) label.textContent = `WebRTC Status: ${st}`;
+          if (st === 'connected') DuelManager.connected = true;
+          if (st === 'disconnected' || st === 'failed') DuelManager.connected = false;
+        };
+      },
+
+      setupChannel: () => {
+        if (!DuelManager.channel) return;
+        DuelManager.channel.onopen = () => {
+          DuelManager.connected = true;
+          const label = document.getElementById('webrtc-status');
+          if (label) label.textContent = `Connected! Axis Duel in session.`;
+        };
+        DuelManager.channel.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (DuelManager.isHost && data.z !== undefined) {
+              DuelManager.p2TiltZ = data.z;
+            } else if (!DuelManager.isHost && data.x !== undefined) {
+              DuelManager.p1TiltX = data.x;
+            }
+          } catch (err) {}
+        };
+      },
+
+      sendInput: (x, z) => {
+        if (!DuelManager.connected || !DuelManager.channel || DuelManager.channel.readyState !== 'open') return;
+        if (DuelManager.isHost) {
+          DuelManager.channel.send(JSON.stringify({ x }));
+        } else {
+          DuelManager.channel.send(JSON.stringify({ z }));
+        }
+      }
+    };
+
+    // --- Level Geometry Merger ---
+    // Merges static boxes & ramps into a single BufferGeometry with vertex colors
+    function mergeLevelMeshes(primitives, palette) {
+      const positions = [];
+      const normals = [];
+      const colors = [];
+
+      // Box face templates
+      const boxFaces = [
+        { dir: [ 1,  0,  0], corners: [[1,-1,-1], [1, 1,-1], [1, 1, 1], [1,-1, 1]] }, // +X
+        { dir: [-1,  0,  0], corners: [[-1,-1, 1], [-1, 1, 1], [-1, 1,-1], [-1,-1,-1]] }, // -X
+        { dir: [ 0,  1,  0], corners: [[-1, 1,-1], [ 1, 1,-1], [ 1, 1, 1], [-1, 1, 1]] }, // +Y (top)
+        { dir: [ 0, -1,  0], corners: [[-1,-1, 1], [ 1,-1, 1], [ 1,-1,-1], [-1,-1,-1]] }, // -Y
+        { dir: [ 0,  0,  1], corners: [[-1,-1, 1], [ 1,-1, 1], [ 1, 1, 1], [-1, 1, 1]] }, // +Z
+        { dir: [ 0,  0, -1], corners: [[ 1,-1,-1], [-1,-1,-1], [-1, 1,-1], [ 1, 1,-1]] }  // -Z
+      ];
+
+      primitives.forEach(prim => {
+        const col = palette[prim.colorIdx || 0];
+
+        if (prim.type === 'box') {
+          const hw = prim.w * 0.5;
+          const hh = prim.h * 0.5;
+          const hd = prim.d * 0.5;
+          const ox = prim.x, oy = prim.y, oz = prim.z;
+
+          boxFaces.forEach(face => {
+            const nx = face.dir[0], ny = face.dir[1], nz = face.dir[2];
+            // Slight color variation on sides vs top for depth
+            const shade = (ny > 0) ? 1.0 : (ny < 0 ? 0.6 : 0.82);
+            const cr = col[0] * shade, cg = col[1] * shade, cb = col[2] * shade;
+
+            const c = face.corners.map(cn => [
+              ox + cn[0] * hw,
+              oy + cn[1] * hh,
+              oz + cn[2] * hd
+            ]);
+
+            // Triangle 1 (0, 1, 2)
+            [0, 1, 2].forEach(i => {
+              positions.push(c[i][0], c[i][1], c[i][2]);
+              normals.push(nx, ny, nz);
+              colors.push(cr, cg, cb);
+            });
+            // Triangle 2 (0, 2, 3)
+            [0, 2, 3].forEach(i => {
+              positions.push(c[i][0], c[i][1], c[i][2]);
+              normals.push(nx, ny, nz);
+              colors.push(cr, cg, cb);
+            });
+          });
+        } else if (prim.type === 'ramp') {
+          // Wedges along Z or X
+          const hw = prim.w * 0.5;
+          const hh = prim.h;
+          const hd = prim.d * 0.5;
+          const ox = prim.x, oy = prim.y - prim.h * 0.5, oz = prim.z;
+
+          let pA, pB, pC, pD, pE, pF; // Wedge vertices
+          let rampNormal = [0, 1, 0];
+
+          if (prim.dir === '+z') {
+            // Slopes upward from -Z to +Z
+            pA = [ox - hw, oy, oz - hd];
+            pB = [ox + hw, oy, oz - hd];
+            pC = [ox + hw, oy + hh, oz + hd];
+            pD = [ox - hw, oy + hh, oz + hd];
+            pE = [ox + hw, oy, oz + hd];
+            pF = [ox - hw, oy, oz + hd];
+            const hyp = Math.sqrt(prim.d * prim.d + hh * hh);
+            rampNormal = [0, prim.d / hyp, -hh / hyp];
+          } else {
+            // Slopes upward from +Z to -Z ('-z')
+            pA = [ox - hw, oy + hh, oz - hd];
+            pB = [ox + hw, oy + hh, oz - hd];
+            pC = [ox + hw, oy, oz + hd];
+            pD = [ox - hw, oy, oz + hd];
+            pE = [ox + hw, oy, oz - hd];
+            pF = [ox - hw, oy, oz - hd];
+            const hyp = Math.sqrt(prim.d * prim.d + hh * hh);
+            rampNormal = [0, prim.d / hyp, hh / hyp];
+          }
+
+          const cr = col[0], cg = col[1], cb = col[2];
+
+          // Top sloped surface (pA, pB, pC) & (pA, pC, pD)
+          [pA, pB, pC, pA, pC, pD].forEach(p => {
+            positions.push(p[0], p[1], p[2]);
+            normals.push(rampNormal[0], rampNormal[1], rampNormal[2]);
+            colors.push(cr, cg, cb);
+          });
+        }
+      });
+
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      return geom;
+    }
+
+    // --- LEVEL DATA DEFINITIONS (12 HANDCRAFTED LEVELS) ---
+    // Color palettes: Pastel shades
+    const PALETTES = [
+      [[0.48, 0.76, 0.68], [0.38, 0.64, 0.58], [0.88, 0.82, 0.72]], // Mint Stone
+      [[0.92, 0.58, 0.52], [0.82, 0.48, 0.42], [0.94, 0.85, 0.74]], // Terracotta Peach
+      [[0.58, 0.54, 0.78], [0.46, 0.42, 0.68], [0.85, 0.82, 0.92]], // Lavender Granite
+      [[0.92, 0.78, 0.44], [0.80, 0.66, 0.35], [0.96, 0.92, 0.78]], // Warm Sandstone
+      [[0.44, 0.66, 0.90], [0.34, 0.54, 0.78], [0.80, 0.88, 0.96]]  // Frost Blue
+    ];
+
+    const LEVELS = [
+      // Level 1: The First Tilt (Introduction)
+      {
+        id: 1,
+        title: "The First Tilt",
+        parTime: 12.0,
+        goldTime: 8.5,
+        paletteIdx: 0,
+        startPos: [0, 1.2, 8],
+        goalPos: [0, 0.4, -8],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 8, w: 6, h: 0.8, d: 6, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 4, h: 0.8, d: 10, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -8, w: 6, h: 0.8, d: 6, colorIdx: 0 },
+          // Boundary guide lips
+          { type: 'box', x: -3.2, y: 0.5, z: 8, w: 0.4, h: 0.6, d: 6, colorIdx: 2 },
+          { type: 'box', x:  3.2, y: 0.5, z: 8, w: 0.4, h: 0.6, d: 6, colorIdx: 2 },
+        ],
+        stars: [ [0, 1.0, 4], [0, 1.0, 0], [0, 1.0, -4] ],
+        pickups: [],
+        hazards: []
+      },
+
+      // Level 2: The Cascades (Ramps & Velocity)
+      {
+        id: 2,
+        title: "The Cascades",
+        parTime: 16.0,
+        goldTime: 11.0,
+        paletteIdx: 1,
+        startPos: [0, 3.8, 12],
+        goalPos: [0, 0.4, -12],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 3.0, z: 12, w: 5, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'ramp', x: 0, y: 2.0, z: 6, w: 4, h: 2.0, d: 7, dir: '-z', colorIdx: 1 },
+          { type: 'box', x: 0, y: 1.0, z: 0, w: 5, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'ramp', x: 0, y: 0.5, z: -6, w: 4, h: 1.0, d: 7, dir: '-z', colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -12, w: 6, h: 0.8, d: 6, colorIdx: 0 }
+        ],
+        stars: [ [0, 2.5, 6], [0, 1.6, 0], [0, 1.2, -6] ],
+        pickups: [],
+        hazards: []
+      },
+
+      // Level 3: The Narrow Ridge (Balance & Checkpoint)
+      {
+        id: 3,
+        title: "The Narrow Ridge",
+        parTime: 20.0,
+        goldTime: 14.5,
+        paletteIdx: 2,
+        startPos: [-8, 0.8, 8],
+        goalPos: [8, 0.8, -8],
+        staticGeometry: [
+          { type: 'box', x: -8, y: 0, z: 8, w: 5, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: -4, y: 0, z: 8, w: 4, h: 0.8, d: 1.8, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: 4, w: 1.8, h: 0.8, d: 10, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 4, h: 0.8, d: 4, colorIdx: 0 }, // Checkpoint platform
+          { type: 'box', x: 4, y: 0, z: -4, w: 1.8, h: 0.8, d: 10, colorIdx: 1 },
+          { type: 'box', x: 8, y: 0, z: -8, w: 5, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [-4, 1.0, 8], [0, 1.0, -1], [4, 1.0, -6] ],
+        pickups: [
+          { type: 'checkpoint', x: 0, y: 0.45, z: 0 }
+        ],
+        hazards: []
+      },
+
+      // Level 4: Moving Bastions (Moving Hazard Blocks)
+      {
+        id: 4,
+        title: "Moving Bastions",
+        parTime: 22.0,
+        goldTime: 15.0,
+        paletteIdx: 3,
+        startPos: [0, 0.8, 11],
+        goalPos: [0, 0.8, -11],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 11, w: 6, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 5.5, h: 0.8, d: 17, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -11, w: 6, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [0, 1.0, 4.5], [0, 1.0, 0], [0, 1.0, -4.5] ],
+        pickups: [],
+        hazards: [
+          { type: 'movingBlock', x: 0, y: 0.8, z: 4.5, w: 2.2, h: 1.2, d: 1.2, ampX: 2.2, speed: 2.4, colorIdx: 2 },
+          { type: 'movingBlock', x: 0, y: 0.8, z: -3.5, w: 2.2, h: 1.2, d: 1.2, ampX: -2.2, speed: 2.7, colorIdx: 2 }
+        ]
+      },
+
+      // Level 5: Whirling Blades (Spinning Bars)
+      {
+        id: 5,
+        title: "Whirling Blades",
+        parTime: 24.0,
+        goldTime: 17.0,
+        paletteIdx: 4,
+        startPos: [0, 0.8, 12],
+        goalPos: [0, 0.8, -12],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 12, w: 6, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 4, w: 7, h: 0.8, d: 7, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -4, w: 7, h: 0.8, d: 7, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -12, w: 6, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [-2, 1.0, 4], [2, 1.0, -4], [0, 1.0, -8] ],
+        pickups: [
+          { type: 'checkpoint', x: 0, y: 0.45, z: 0 }
+        ],
+        hazards: [
+          { type: 'spinningBar', x: 0, y: 0.6, z: 4, length: 5.6, height: 0.8, speed: 2.1 },
+          { type: 'spinningBar', x: 0, y: 0.6, z: -4, length: 5.6, height: 0.8, speed: -2.5 }
+        ]
+      },
+
+      // Level 6: Crumbly Crossing (Crumbling Tiles)
+      {
+        id: 6,
+        title: "Crumbly Crossing",
+        parTime: 20.0,
+        goldTime: 13.5,
+        paletteIdx: 0,
+        startPos: [0, 0.8, 11],
+        goalPos: [0, 0.8, -11],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 11, w: 6, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: -11, w: 6, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [0, 1.0, 6], [0, 1.0, 0], [0, 1.0, -6] ],
+        pickups: [],
+        hazards: [
+          // Row of crumbling stepping stones
+          { type: 'crumblingTile', x:  0, y: 0, z:  6, w: 2.5, h: 0.8, d: 2.5 },
+          { type: 'crumblingTile', x:  0, y: 0, z:  3, w: 2.5, h: 0.8, d: 2.5 },
+          { type: 'crumblingTile', x:  0, y: 0, z:  0, w: 2.5, h: 0.8, d: 2.5 },
+          { type: 'crumblingTile', x:  0, y: 0, z: -3, w: 2.5, h: 0.8, d: 2.5 },
+          { type: 'crumblingTile', x:  0, y: 0, z: -6, w: 2.5, h: 0.8, d: 2.5 }
+        ]
+      },
+
+      // Level 7: The Inverter (Reverse-Tilt Zones)
+      {
+        id: 7,
+        title: "The Inverter",
+        parTime: 25.0,
+        goldTime: 18.0,
+        paletteIdx: 1,
+        startPos: [0, 0.8, 12],
+        goalPos: [0, 0.8, -12],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 12, w: 6, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 6, w: 4, h: 0.8, d: 6, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 5, h: 0.8, d: 6, colorIdx: 2 }, // Inverted Zone
+          { type: 'box', x: 0, y: 0, z: -6, w: 4, h: 0.8, d: 6, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -12, w: 6, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [0, 1.0, 6], [1.5, 1.0, 0], [0, 1.0, -6] ],
+        pickups: [],
+        hazards: [
+          { type: 'reverseZone', x: 0, y: 0.5, z: 0, w: 5, h: 1.5, d: 6 }
+        ]
+      },
+
+      // Level 8: Time Warp (Fast Sweepers & Slow-Mo Pickups)
+      {
+        id: 8,
+        title: "Time Warp",
+        parTime: 28.0,
+        goldTime: 19.5,
+        paletteIdx: 2,
+        startPos: [-9, 0.8, 9],
+        goalPos: [9, 0.8, -9],
+        staticGeometry: [
+          { type: 'box', x: -9, y: 0, z: 9, w: 5, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 20, h: 0.8, d: 5, colorIdx: 1 },
+          { type: 'box', x: 9, y: 0, z: -9, w: 5, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [-4, 1.0, 0], [0, 1.0, 0], [5, 1.0, 0] ],
+        pickups: [
+          { type: 'timeShard', x: -6, y: 1.0, z: 4.5 },
+          { type: 'timeShard', x:  3, y: 1.0, z: -4.5 }
+        ],
+        hazards: [
+          { type: 'movingBlock', x: -2, y: 0.8, z: 0, w: 1.5, h: 1.5, d: 4.8, ampZ: 0, ampX: 3.5, speed: 4.5, colorIdx: 2 },
+          { type: 'movingBlock', x:  2, y: 0.8, z: 0, w: 1.5, h: 1.5, d: 4.8, ampZ: 0, ampX: -3.5, speed: 4.8, colorIdx: 2 }
+        ]
+      },
+
+      // Level 9: Magnetic Heights (Magnet & Void Stars)
+      {
+        id: 9,
+        title: "Magnetic Heights",
+        parTime: 26.0,
+        goldTime: 18.0,
+        paletteIdx: 3,
+        startPos: [0, 0.8, 12],
+        goalPos: [0, 0.8, -12],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 12, w: 6, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 2.5, h: 0.8, d: 18, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -12, w: 6, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        // Stars hover over the side voids, requiring the Magnet!
+        stars: [ [-3.8, 1.2, 4], [3.8, 1.2, 0], [-3.8, 1.2, -4] ],
+        pickups: [
+          { type: 'magnet', x: 0, y: 1.0, z: 8 },
+          { type: 'checkpoint', x: 0, y: 0.45, z: 0 }
+        ],
+        hazards: []
+      },
+
+      // Level 10: Pinball Garden (Bounce Bumpers)
+      {
+        id: 10,
+        title: "Pinball Garden",
+        parTime: 25.0,
+        goldTime: 16.5,
+        paletteIdx: 4,
+        startPos: [0, 0.8, 12],
+        goalPos: [0, 0.8, -12],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 0, w: 14, h: 0.8, d: 28, colorIdx: 0 },
+          // Boundary walls
+          { type: 'box', x: -7.2, y: 0.8, z: 0, w: 0.5, h: 1.2, d: 28, colorIdx: 1 },
+          { type: 'box', x:  7.2, y: 0.8, z: 0, w: 0.5, h: 1.2, d: 28, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0.8, z: 14.2, w: 14, h: 1.2, d: 0.5, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0.8, z: -14.2, w: 14, h: 1.2, d: 0.5, colorIdx: 1 }
+        ],
+        stars: [ [-4, 1.0, 5], [4, 1.0, 0], [-4, 1.0, -5] ],
+        pickups: [],
+        hazards: [
+          { type: 'spinningBar', x: 0, y: 0.6, z: 6, length: 6.0, height: 0.8, speed: 2.8 },
+          { type: 'spinningBar', x: 0, y: 0.6, z: -6, length: 6.0, height: 0.8, speed: -2.8 },
+          { type: 'movingBlock', x: -3, y: 0.8, z: 0, w: 2.0, h: 1.0, d: 2.0, ampX: 2.5, speed: 3.2, colorIdx: 2 },
+          { type: 'movingBlock', x:  3, y: 0.8, z: 0, w: 2.0, h: 1.0, d: 2.0, ampX: -2.5, speed: 3.2, colorIdx: 2 }
+        ]
+      },
+
+      // Level 11: The Spiral Ascent (Helical Ascent with Shortcuts)
+      {
+        id: 11,
+        title: "The Spiral Ascent",
+        parTime: 32.0,
+        goldTime: 22.0,
+        paletteIdx: 0,
+        startPos: [-9, 0.8, 9],
+        goalPos: [0, 4.2, 0],
+        staticGeometry: [
+          { type: 'box', x: -9, y: 0, z: 9, w: 5, h: 0.8, d: 5, colorIdx: 0 },
+          // Ring path ascending
+          { type: 'box', x: 0, y: 0.5, z: 9, w: 14, h: 0.8, d: 3, colorIdx: 1 },
+          { type: 'box', x: 9, y: 1.2, z: 0, w: 3, h: 0.8, d: 18, colorIdx: 1 },
+          { type: 'box', x: 0, y: 2.0, z: -9, w: 18, h: 0.8, d: 3, colorIdx: 1 },
+          { type: 'box', x: -9, y: 2.8, z: -2, w: 3, h: 0.8, d: 14, colorIdx: 1 },
+          { type: 'ramp', x: -4, y: 3.4, z: 0, w: 4, h: 1.0, d: 3, dir: '+z', colorIdx: 0 },
+          { type: 'box', x: 0, y: 3.8, z: 0, w: 5, h: 0.8, d: 5, colorIdx: 2 } // Peak goal
+        ],
+        stars: [ [9, 2.2, 0], [0, 3.0, -9], [-9, 3.8, -2] ],
+        pickups: [
+          { type: 'checkpoint', x: 9, y: 1.6, z: 0 },
+          { type: 'timeShard', x: 0, y: 2.8, z: -9 }
+        ],
+        hazards: [
+          { type: 'crumblingTile', x: -3, y: 0.5, z: 9, w: 2.5, h: 0.8, d: 2.5 },
+          { type: 'spinningBar', x: 9, y: 1.8, z: -4, length: 4.5, height: 0.8, speed: 2.4 }
+        ]
+      },
+
+      // Level 12: Apex Citadel (Ultimate Challenge)
+      {
+        id: 12,
+        title: "Apex Citadel",
+        parTime: 40.0,
+        goldTime: 27.0,
+        paletteIdx: 1,
+        startPos: [0, 0.8, 14],
+        goalPos: [0, 0.8, -14],
+        staticGeometry: [
+          { type: 'box', x: 0, y: 0, z: 14, w: 6, h: 0.8, d: 5, colorIdx: 0 },
+          { type: 'box', x: 0, y: 0, z: 7, w: 4, h: 0.8, d: 8, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: 0, w: 9, h: 0.8, d: 5, colorIdx: 2 }, // Hub
+          { type: 'box', x: 0, y: 0, z: -7, w: 4, h: 0.8, d: 8, colorIdx: 1 },
+          { type: 'box', x: 0, y: 0, z: -14, w: 6, h: 0.8, d: 5, colorIdx: 0 }
+        ],
+        stars: [ [-3.5, 1.0, 0], [0, 1.0, 0], [3.5, 1.0, 0] ],
+        pickups: [
+          { type: 'magnet', x: 0, y: 1.0, z: 10 },
+          { type: 'checkpoint', x: 0, y: 0.45, z: 0 },
+          { type: 'timeShard', x: 0, y: 1.0, z: -10 }
+        ],
+        hazards: [
+          { type: 'movingBlock', x: 0, y: 0.8, z: 7, w: 2.5, h: 1.2, d: 1.5, ampX: 2.5, speed: 3.0, colorIdx: 0 },
+          { type: 'spinningBar', x: 0, y: 0.6, z: 0, length: 7.2, height: 0.8, speed: 2.2 },
+          { type: 'reverseZone', x: 0, y: 0.5, z: -7, w: 4, h: 1.5, d: 8 }
+        ]
+      }
+    ];
+
+    // --- DAILY ISLAND PROCEDURAL GENERATOR ---
+    function generateDailyIsland(dateStr) {
+      const seed = hashDateSeed(dateStr);
+      const rng = new PRNG(seed);
+      const paletteIdx = Math.floor(rng.next() * PALETTES.length);
+
+      const staticGeometry = [];
+      const stars = [];
+      const pickups = [];
+      const hazards = [];
+
+      // Start platform
+      const startPos = [0, 0.8, 12];
+      staticGeometry.push({ type: 'box', x: 0, y: 0, z: 12, w: 6, h: 0.8, d: 5, colorIdx: 0 });
+
+      // Generate 4 procedural sequential chunks
+      let curX = 0, curY = 0, curZ = 8;
+      for (let i = 0; i < 4; i++) {
+        const nextZ = curZ - 5;
+        const nextX = curX + (rng.next() > 0.5 ? 3 : -3);
+        const w = 4 + rng.next() * 2;
+        const d = 5;
+        staticGeometry.push({
+          type: 'box',
+          x: (curX + nextX) * 0.5,
+          y: curY,
+          z: nextZ,
+          w: Math.abs(nextX - curX) + w,
+          h: 0.8,
+          d: d,
+          colorIdx: (i + 1) % 3
+        });
+
+        // Add hazards & stars per chunk
+        if (i === 1) {
+          hazards.push({
+            type: 'movingBlock',
+            x: (curX + nextX) * 0.5,
+            y: curY + 0.8,
+            z: nextZ,
+            w: 2.0, h: 1.2, d: 1.2,
+            ampX: 2.0, speed: 2.5, colorIdx: 2
+          });
+          pickups.push({ type: 'timeShard', x: curX, y: curY + 1.0, z: curZ - 2 });
+        } else if (i === 2) {
+          hazards.push({
+            type: 'spinningBar',
+            x: nextX, y: curY + 0.6, z: nextZ,
+            length: 5.5, height: 0.8, speed: rng.next() > 0.5 ? 2.5 : -2.5
+          });
+          pickups.push({ type: 'checkpoint', x: nextX, y: curY + 0.45, z: nextZ });
+        } else if (i === 3) {
+          hazards.push({
+            type: 'reverseZone',
+            x: nextX, y: curY + 0.5, z: nextZ,
+            w: w, h: 1.5, d: d
+          });
+        }
+
+        if (i < 3) {
+          stars.push([nextX, curY + 1.0, nextZ]);
+        }
+
+        curX = nextX;
+        curZ = nextZ - 2;
+      }
+
+      // Goal Platform
+      const goalPos = [curX, curY + 0.4, curZ - 3];
+      staticGeometry.push({ type: 'box', x: curX, y: curY, z: curZ - 3, w: 6, h: 0.8, d: 6, colorIdx: 0 });
+
+      return {
+        id: 'daily',
+        title: `Daily Island: ${dateStr}`,
+        parTime: 30.0,
+        goldTime: 20.0,
+        paletteIdx: paletteIdx,
+        startPos: startPos,
+        goalPos: goalPos,
+        staticGeometry: staticGeometry,
+        stars: stars,
+        pickups: pickups,
+        hazards: hazards
+      };
+    }
+
+    // --- GAME ENGINE STATE & THREE.JS SETUP ---
+    const canvas = document.getElementById('game-canvas');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1c182b);
+    scene.fog = new THREE.FogExp2(0x1c182b, 0.012);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.5, 150);
+    camera.position.set(0, 24, 28);
+    camera.lookAt(0, 0, 0);
+
+    // Renderer (Potato PC targeted: antialias false, cap pixel ratio)
+    const renderer = new THREE.WebGLRenderer({
+      canvas: canvas,
+      antialias: false,
+      powerPreference: 'high-performance',
+      precision: 'mediump'
+    });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.0));
+
+    // Directional + Ambient Lighting (0 shadows for max speed)
+    const dirLight = new THREE.DirectionalLight(0xfff3e0, 0.85);
+    dirLight.position.set(16, 32, 20);
+    scene.add(dirLight);
+
+    const ambLight = new THREE.AmbientLight(0x7c7895, 0.65);
+    scene.add(ambLight);
+
+    // Island Hierarchy Group: Tilts around X and Z
+    const islandGroup = new THREE.Group();
+    scene.add(islandGroup);
+
+    // Reusable Math Scratches (Zero allocations per frame)
+    const SCRATCH_VEC1 = new THREE.Vector3();
+    const SCRATCH_VEC2 = new THREE.Vector3();
+    const SCRATCH_VEC3 = new THREE.Vector3();
+    const SCRATCH_QUAT1 = new THREE.Quaternion();
+    const SCRATCH_EULER1 = new THREE.Euler();
+    const WORLD_GRAVITY = new THREE.Vector3(0, -28.0, 0);
+
+    // Materials Pool
+    const staticMat = new THREE.MeshLambertMaterial({
+      vertexColors: true
+    });
+
+    const marbleMat = new THREE.MeshLambertMaterial({
+      color: 0x00f0ff,
+      emissive: 0x006688
+    });
+
+    const ghostMat = new THREE.MeshLambertMaterial({
+      color: 0xff3388,
+      emissive: 0x661133,
+      transparent: true,
+      opacity: 0.45,
+      wireframe: true
+    });
+
+    const starMat = new THREE.MeshLambertMaterial({
+      color: 0xffd152,
+      emissive: 0x775511
+    });
+
+    const hazardMat = new THREE.MeshLambertMaterial({
+      color: 0xff4d6d,
+      emissive: 0x44111e
+    });
+
+    const goalRingMat = new THREE.MeshLambertMaterial({
+      color: 0x2ecc71,
+      emissive: 0x115522
+    });
+
+    const pickupMatTime = new THREE.MeshLambertMaterial({
+      color: 0x00e5ff,
+      emissive: 0x004455
+    });
+
+    const pickupMatMagnet = new THREE.MeshLambertMaterial({
+      color: 0xffd700,
+      emissive: 0x554400
+    });
+
+    // Reusable Geometries
+    const sphereGeom = new THREE.SphereBufferGeometry(0.55, 12, 10);
+    const starGeom = new THREE.OctahedronBufferGeometry(0.35, 0);
+    const goalGeom = new THREE.CylinderBufferGeometry(1.4, 1.4, 0.15, 16);
+    const timeShardGeom = new THREE.DodecahedronBufferGeometry(0.4, 0);
+    const magnetGeom = new THREE.TorusBufferGeometry(0.35, 0.12, 6, 12);
+    const checkpointGeom = new THREE.CylinderBufferGeometry(1.2, 1.2, 0.12, 16);
+
+    // Marble Mesh (Added inside islandGroup for local simulation)
+    const marbleMesh = new THREE.Mesh(sphereGeom, marbleMat);
+    islandGroup.add(marbleMesh);
+
+    // Ghost Mesh
+    const ghostMesh = new THREE.Mesh(sphereGeom, ghostMat);
+    ghostMesh.visible = false;
+    islandGroup.add(ghostMesh);
+
+    // Goal Mesh
+    const goalMesh = new THREE.Mesh(goalGeom, goalRingMat);
+    islandGroup.add(goalMesh);
+
+    // Particle Trail (Fixed pool of 40 points)
+    const TRAIL_COUNT = 40;
+    const trailPositions = new Float32Array(TRAIL_COUNT * 3);
+    for (let i = 0; i < trailPositions.length; i++) trailPositions[i] = -9999;
+    const trailGeom = new THREE.BufferGeometry();
+    trailGeom.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+    const trailMat = new THREE.PointsMaterial({
+      color: 0x00f0ff,
+      size: 0.28,
+      transparent: true,
+      opacity: 0.65
+    });
+    const trailPoints = new THREE.Points(trailGeom, trailMat);
+    trailPoints.frustumCulled = false;
+    islandGroup.add(trailPoints);
+    let trailHead = 0;
+    let trailTimer = 0;
+
+    // --- GAMEPLAY & INPUT STATE ---
+    const MAX_TILT_RAD = 25 * (Math.PI / 180); // ±25°
+    let currentTiltX = 0;
+    let currentTiltZ = 0;
+    let targetTiltX = 0;
+    let targetTiltZ = 0;
+    const TILT_SMOOTHING = 0.11; // Heavy mechanical feel
+
+    // Active Level & Entity References
+    let currentLevelData = null;
+    let currentLevelIdx = 0;
+    let staticLevelMesh = null;
+    let activeStars = [];
+    let activePickups = [];
+    let activeHazards = [];
+    let activeCrumblingTiles = [];
+    let activeReverseZones = [];
+
+    // Marble Physics State (Island Local Coordinates)
+    const marble = {
+      pos: new THREE.Vector3(0, 2, 0),
+      vel: new THREE.Vector3(0, 0, 0),
+      radius: 0.55,
+      isGrounded: false,
+      checkpointPos: new THREE.Vector3(0, 2, 0),
+      hasFallen: false
+    };
+
+    // Game Session Stats
+    let gameRunning = false;
+    let levelTimer = 0;
+    let starsCollected = 0;
+    let slowMoTimer = 0;
+    let magnetTimer = 0;
+    let isReverseTiltActive = false;
+
+    // Ghost Recording & Playback State
+    let recordedKeyframes = [];
+    let recordTimer = 0;
+    let ghostRunData = null;
+    let ghostPlaybackTimer = 0;
+
+    // Settings
+    const settings = {
+      renderScale: 0.75,
+      potatoMode: false,
+      controlMode: 'auto', // 'auto', 'pointer', 'drag', 'keys', 'gyro'
+      volume: 0.7
+    };
+
+    // Keyboard Input State
+    const keys = { w: false, a: false, s: false, d: false, up: false, left: false, down: false, right: false };
+
+    // Mouse / Touch Drag & Pointer State
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartZ = 0;
+    let dragTiltX = 0;
+    let dragTiltZ = 0;
+    let pointerTiltX = 0;
+    let pointerTiltZ = 0;
+
+    // Gyroscope State
+    let gyroBeta = 0;
+    let gyroGamma = 0;
+    let gyroAvailable = false;
+
+    // --- INPUT EVENT LISTENERS ---
+    window.addEventListener('keydown', (e) => {
+      audio.ensureActive();
+      const k = e.key.toLowerCase();
+      if (k === 'w') keys.w = true;
+      if (k === 'a') keys.a = true;
+      if (k === 's') keys.s = true;
+      if (k === 'd') keys.d = true;
+      if (e.key === 'ArrowUp') keys.up = true;
+      if (e.key === 'ArrowLeft') keys.left = true;
+      if (e.key === 'ArrowDown') keys.down = true;
+      if (e.key === 'ArrowRight') keys.right = true;
+
+      if (k === 'r' || k === ' ') restartLevel();
+      if (k === 'l') toggleModal('modal-levels');
+      if (k === 'm') toggleMute();
+      if (k === 'g') toggleModal('modal-duel');
+      if (e.key === 'Escape') toggleModal('modal-settings');
+    });
+
+    window.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'w') keys.w = false;
+      if (k === 'a') keys.a = false;
+      if (k === 's') keys.s = false;
+      if (k === 'd') keys.d = false;
+      if (e.key === 'ArrowUp') keys.up = false;
+      if (e.key === 'ArrowLeft') keys.left = false;
+      if (e.key === 'ArrowDown') keys.down = false;
+      if (e.key === 'ArrowRight') keys.right = false;
+    });
+
+    // Pointer / Touch Handlers
+    window.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('#hud-buttons') || e.target.closest('.modal-card')) return;
+      audio.ensureActive();
+      isDragging = true;
+      dragStartX = e.clientX;
+      dragStartZ = e.clientY;
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      const nx = (e.clientX / window.innerWidth) * 2 - 1;
+      const ny = (e.clientY / window.innerHeight) * 2 - 1;
+      const len = Math.sqrt(nx * nx + ny * ny);
+      if (len > 0.12) {
+        pointerTiltX = ny * MAX_TILT_RAD;
+        pointerTiltZ = -nx * MAX_TILT_RAD;
+      } else {
+        pointerTiltX = 0;
+        pointerTiltZ = 0;
+      }
+
+      if (isDragging) {
+        const dx = (e.clientX - dragStartX) / (window.innerWidth * 0.35);
+        const dy = (e.clientY - dragStartZ) / (window.innerHeight * 0.35);
+        dragTiltX = Math.max(-MAX_TILT_RAD, Math.min(MAX_TILT_RAD, dy * MAX_TILT_RAD));
+        dragTiltZ = Math.max(-MAX_TILT_RAD, Math.min(MAX_TILT_RAD, -dx * MAX_TILT_RAD));
+      }
+    });
+
+    window.addEventListener('pointerup', () => {
+      isDragging = false;
+      dragTiltX = 0;
+      dragTiltZ = 0;
+    });
+
+    window.addEventListener('pointercancel', () => {
+      isDragging = false;
+      dragTiltX = 0;
+      dragTiltZ = 0;
+    });
+
+    // Device Gyroscope (Mobile Tilt)
+    window.addEventListener('deviceorientation', (e) => {
+      if (e.beta !== null && e.gamma !== null) {
+        gyroAvailable = true;
+        gyroBeta = e.beta;   // front-to-back tilt [-180, 180]
+        gyroGamma = e.gamma; // left-to-right tilt [-90, 90]
+      }
+    });
+
+    // --- LEVEL LOADER & INITIALIZATION ---
+    function loadLevel(levelIndexOrData) {
+      let lvl;
+      if (typeof levelIndexOrData === 'number') {
+        currentLevelIdx = levelIndexOrData;
+        lvl = LEVELS[levelIndexOrData];
+      } else {
+        lvl = levelIndexOrData;
+      }
+      currentLevelData = lvl;
+
+      // Update HUD info
+      document.getElementById('hud-level-badge-text').textContent = (typeof lvl.id === 'number') ? `STAGE ${String(lvl.id).padStart(2, '0')}` : 'DAILY';
+      document.getElementById('hud-level-name').textContent = lvl.title;
+      resetHudStars();
+
+      // Clean up previous dynamic meshes from island
+      if (staticLevelMesh) {
+        islandGroup.remove(staticLevelMesh);
+        staticLevelMesh.geometry.dispose();
+        staticLevelMesh = null;
+      }
+      activeStars.forEach(s => islandGroup.remove(s.mesh));
+      activePickups.forEach(p => islandGroup.remove(p.mesh));
+      activeHazards.forEach(h => islandGroup.remove(h.mesh));
+      activeCrumblingTiles.forEach(c => islandGroup.remove(c.mesh));
+      activeReverseZones.forEach(z => islandGroup.remove(z.mesh));
+
+      activeStars = [];
+      activePickups = [];
+      activeHazards = [];
+      activeCrumblingTiles = [];
+      activeReverseZones = [];
+
+      // Build & Merge static level geometry into a single draw call!
+      const palette = PALETTES[lvl.paletteIdx % PALETTES.length];
+      const mergedGeom = mergeLevelMeshes(lvl.staticGeometry, palette);
+      staticLevelMesh = new THREE.Mesh(mergedGeom, staticMat);
+      islandGroup.add(staticLevelMesh);
+
+      // Position Goal Pad
+      goalMesh.position.set(lvl.goalPos[0], lvl.goalPos[1], lvl.goalPos[2]);
+
+      // Populate Stars
+      lvl.stars.forEach((sp, idx) => {
+        const starMesh = new THREE.Mesh(starGeom, starMat);
+        starMesh.position.set(sp[0], sp[1], sp[2]);
+        islandGroup.add(starMesh);
+        activeStars.push({ mesh: starMesh, pos: new THREE.Vector3(sp[0], sp[1], sp[2]), collected: false, idx: idx });
+      });
+
+      // Populate Pickups
+      lvl.pickups.forEach(p => {
+        let pMesh;
+        if (p.type === 'timeShard') {
+          pMesh = new THREE.Mesh(timeShardGeom, pickupMatTime);
+        } else if (p.type === 'magnet') {
+          pMesh = new THREE.Mesh(magnetGeom, pickupMatMagnet);
+        } else if (p.type === 'checkpoint') {
+          pMesh = new THREE.Mesh(checkpointGeom, new THREE.MeshLambertMaterial({ color: 0x34495e, emissive: 0x1a252f }));
+        }
+        pMesh.position.set(p.x, p.y, p.z);
+        islandGroup.add(pMesh);
+        activePickups.push({ mesh: pMesh, type: p.type, pos: new THREE.Vector3(p.x, p.y, p.z), collected: false });
+      });
+
+      // Populate Hazards
+      lvl.hazards.forEach(h => {
+        if (h.type === 'movingBlock') {
+          const hGeom = new THREE.BoxBufferGeometry(h.w, h.h, h.d);
+          const hMesh = new THREE.Mesh(hGeom, hazardMat);
+          hMesh.position.set(h.x, h.y, h.z);
+          islandGroup.add(hMesh);
+          activeHazards.push({ ...h, mesh: hMesh, basePos: new THREE.Vector3(h.x, h.y, h.z) });
+        } else if (h.type === 'spinningBar') {
+          const hGeom = new THREE.BoxBufferGeometry(h.length, h.height, 0.4);
+          const hMesh = new THREE.Mesh(hGeom, hazardMat);
+          hMesh.position.set(h.x, h.y, h.z);
+          islandGroup.add(hMesh);
+          activeHazards.push({ ...h, mesh: hMesh });
+        } else if (h.type === 'crumblingTile') {
+          const cGeom = new THREE.BoxBufferGeometry(h.w, h.h, h.d);
+          const cMesh = new THREE.Mesh(cGeom, new THREE.MeshLambertMaterial({ color: 0xc49b76 }));
+          cMesh.position.set(h.x, h.y, h.z);
+          islandGroup.add(cMesh);
+          activeCrumblingTiles.push({
+            ...h,
+            mesh: cMesh,
+            basePos: new THREE.Vector3(h.x, h.y, h.z),
+            state: 'idle', // 'idle', 'shaking', 'falling'
+            timer: 0,
+            fallVelocity: 0
+          });
+        } else if (h.type === 'reverseZone') {
+          const zGeom = new THREE.BoxBufferGeometry(h.w, h.h, h.d);
+          const zMat = new THREE.MeshLambertMaterial({ color: 0xff3377, transparent: true, opacity: 0.28, wireframe: true });
+          const zMesh = new THREE.Mesh(zGeom, zMat);
+          zMesh.position.set(h.x, h.y, h.z);
+          islandGroup.add(zMesh);
+          activeReverseZones.push({ ...h, mesh: zMesh });
+        }
+      });
+
+      // Reset Marble State
+      marble.pos.set(lvl.startPos[0], lvl.startPos[1], lvl.startPos[2]);
+      marble.vel.set(0, 0, 0);
+      marble.checkpointPos.copy(marble.pos);
+      marble.hasFallen = false;
+      marbleMesh.position.copy(marble.pos);
+
+      // Reset Timers & Recording
+      levelTimer = 0;
+      starsCollected = 0;
+      slowMoTimer = 0;
+      magnetTimer = 0;
+      recordedKeyframes = [];
+      recordTimer = 0;
+      gameRunning = true;
+
+      // Reset Particle Trail
+      for (let i = 0; i < trailPositions.length; i++) trailPositions[i] = -9999;
+      trailGeom.attributes.position.needsUpdate = true;
+
+      // Load Ghost if available
+      ghostMesh.visible = false;
+      MultiplayerAPI.loadRuns(lvl.id).then(bestRun => {
+        if (bestRun && bestRun.keyframes && bestRun.keyframes.length > 0) {
+          ghostRunData = bestRun;
+          ghostPlaybackTimer = 0;
+          ghostMesh.visible = true;
+          ghostMesh.position.set(bestRun.keyframes[0][1], bestRun.keyframes[0][2], bestRun.keyframes[0][3]);
+        } else {
+          ghostRunData = null;
+        }
+      });
+    }
+
+    function restartLevel() {
+      if (!currentLevelData) return;
+      loadLevel(currentLevelData);
+      closeAllModals();
+    }
+
+    // --- DETERMINISTIC 60HZ PHYSICS ENGINE ---
+    const FIXED_DT = 1.0 / 60.0;
+    const SUB_STEPS = 2;
+    const SUB_DT = FIXED_DT / SUB_STEPS;
+    const RESTITUTION = 0.22;
+    const ROLLING_FRICTION = 0.965;
+
+    function physicsStep(dt) {
+      if (!gameRunning) return;
+
+      // 1. Process Tilt Controls & Smoothing
+      let inputX = 0;
+      let inputZ = 0;
+
+      if (DuelManager.connected) {
+        // Live WebRTC Axis Duel: P1 controls X, P2 controls Z
+        if (DuelManager.isHost) {
+          if (keys.a || keys.left) inputX += MAX_TILT_RAD;
+          if (keys.d || keys.right) inputX -= MAX_TILT_RAD;
+          DuelManager.sendInput(inputX, 0);
+          targetTiltX = 0;
+          targetTiltZ = inputX;
+          // Apply peer's Z tilt
+          targetTiltX = DuelManager.p2TiltZ;
+        } else {
+          if (keys.w || keys.up) inputZ -= MAX_TILT_RAD;
+          if (keys.s || keys.down) inputZ += MAX_TILT_RAD;
+          DuelManager.sendInput(0, inputZ);
+          targetTiltX = inputZ;
+          // Apply peer's X tilt
+          targetTiltZ = DuelManager.p1TiltX;
+        }
+      } else if (DuelManager.localSplitMode) {
+        // Local Split-Axis Practice: A/D = X tilt, W/S = Z tilt
+        if (keys.a) inputX += MAX_TILT_RAD;
+        if (keys.d) inputX -= MAX_TILT_RAD;
+        if (keys.w || keys.up) inputZ -= MAX_TILT_RAD;
+        if (keys.s || keys.down) inputZ += MAX_TILT_RAD;
+        targetTiltX = inputZ;
+        targetTiltZ = inputX;
+      } else {
+        // Unified Smart Input (Keyboard WASD/Arrows + Mouse Drag + Touch + Pointer)
+        let keyActive = false;
+        let keyTiltX = 0;
+        let keyTiltZ = 0;
+
+        if (keys.w || keys.up) { keyTiltX -= MAX_TILT_RAD; keyActive = true; }
+        if (keys.s || keys.down) { keyTiltX += MAX_TILT_RAD; keyActive = true; }
+        if (keys.a || keys.left) { keyTiltZ += MAX_TILT_RAD; keyActive = true; }
+        if (keys.d || keys.right) { keyTiltZ -= MAX_TILT_RAD; keyActive = true; }
+
+        if (keyActive) {
+          targetTiltX = keyTiltX;
+          targetTiltZ = keyTiltZ;
+        } else if (isDragging) {
+          targetTiltX = dragTiltX;
+          targetTiltZ = dragTiltZ;
+        } else if (settings.controlMode === 'pointer') {
+          targetTiltX = pointerTiltX;
+          targetTiltZ = pointerTiltZ;
+        } else if (settings.controlMode === 'gyro' && gyroAvailable) {
+          targetTiltX = Math.max(-MAX_TILT_RAD, Math.min(MAX_TILT_RAD, (gyroBeta - 30) * (Math.PI / 180)));
+          targetTiltZ = Math.max(-MAX_TILT_RAD, Math.min(MAX_TILT_RAD, -gyroGamma * (Math.PI / 180)));
+        } else {
+          targetTiltX = 0;
+          targetTiltZ = 0;
+        }
+      }
+
+      // Check Reverse Tilt Zone
+      let inReverseZone = false;
+      activeReverseZones.forEach(z => {
+        const hx = z.w * 0.5;
+        const hy = z.h * 0.5;
+        const hz = z.d * 0.5;
+        if (Math.abs(marble.pos.x - z.x) <= hx &&
+            Math.abs(marble.pos.y - z.y) <= hy &&
+            Math.abs(marble.pos.z - z.z) <= hz) {
+          inReverseZone = true;
+        }
+      });
+      isReverseTiltActive = inReverseZone;
+      document.getElementById('alert-reverse').classList.toggle('visible', inReverseZone);
+
+      if (inReverseZone) {
+        targetTiltX = -targetTiltX;
+        targetTiltZ = -targetTiltZ;
+      }
+
+      // Apply Inertia Smoothing to Island Tilt
+      currentTiltX += (targetTiltX - currentTiltX) * TILT_SMOOTHING;
+      currentTiltZ += (targetTiltZ - currentTiltZ) * TILT_SMOOTHING;
+      islandGroup.rotation.x = currentTiltX;
+      islandGroup.rotation.z = currentTiltZ;
+
+      // Update Tilt Bubble Indicator in HUD
+      const dot = document.getElementById('tilt-bubble-dot');
+      if (dot) {
+        const bx = (-currentTiltZ / MAX_TILT_RAD) * 28;
+        const by = (currentTiltX / MAX_TILT_RAD) * 28;
+        dot.style.transform = `translate(${bx}px, ${by}px)`;
+      }
+
+      // 2. Compute Local Gravity Vector
+      // g_local = Q_island^(-1) * g_world
+      SCRATCH_EULER1.set(currentTiltX, 0, currentTiltZ, 'ZYX');
+      SCRATCH_QUAT1.setFromEuler(SCRATCH_EULER1).invert();
+      const localGravity = SCRATCH_VEC1.copy(WORLD_GRAVITY).applyQuaternion(SCRATCH_QUAT1);
+
+      // 3. Sub-stepped Collision Resolution
+      for (let step = 0; step < SUB_STEPS; step++) {
+        // Apply acceleration to velocity
+        marble.vel.x += localGravity.x * SUB_DT;
+        marble.vel.y += localGravity.y * SUB_DT;
+        marble.vel.z += localGravity.z * SUB_DT;
+
+        // Predict step position
+        marble.pos.x += marble.vel.x * SUB_DT;
+        marble.pos.y += marble.vel.y * SUB_DT;
+        marble.pos.z += marble.vel.z * SUB_DT;
+
+        marble.isGrounded = false;
+
+        // A. Static Geometry Collisions (Boxes & Ramps)
+        currentLevelData.staticGeometry.forEach(prim => {
+          if (prim.type === 'box') {
+            resolveSphereBox(prim.x, prim.y, prim.z, prim.w, prim.h, prim.d);
+          } else if (prim.type === 'ramp') {
+            resolveSphereRamp(prim);
+          }
+        });
+
+        // B. Dynamic Hazards (Moving Blocks, Spinning Bars, Crumbling Tiles)
+        activeHazards.forEach(h => {
+          if (h.type === 'movingBlock') {
+            resolveSphereBox(h.mesh.position.x, h.mesh.position.y, h.mesh.position.z, h.w, h.h, h.d);
+          } else if (h.type === 'spinningBar') {
+            resolveSphereSpinningBar(h);
+          }
+        });
+
+        activeCrumblingTiles.forEach(c => {
+          if (c.state !== 'falling') {
+            resolveSphereBox(c.mesh.position.x, c.mesh.position.y, c.mesh.position.z, c.w, c.h, c.d, () => {
+              if (c.state === 'idle') {
+                c.state = 'shaking';
+                c.timer = 0.55; // Shakes for 0.55s before falling
+              }
+            });
+          }
+        });
+      }
+
+      // 4. Update Dynamic Hazards Simulation
+      const t = levelTimer;
+      activeHazards.forEach(h => {
+        if (h.type === 'movingBlock') {
+          const ox = h.basePos.x + (h.ampX ? Math.sin(t * h.speed) * h.ampX : 0);
+          const oz = h.basePos.z + (h.ampZ ? Math.sin(t * h.speed) * h.ampZ : 0);
+          h.mesh.position.x = ox;
+          h.mesh.position.z = oz;
+        } else if (h.type === 'spinningBar') {
+          h.mesh.rotation.y += h.speed * dt;
+        }
+      });
+
+      // Update Crumbling Tiles
+      activeCrumblingTiles.forEach(c => {
+        if (c.state === 'shaking') {
+          c.timer -= dt;
+          c.mesh.position.x = c.basePos.x + (Math.random() - 0.5) * 0.08;
+          c.mesh.position.z = c.basePos.z + (Math.random() - 0.5) * 0.08;
+          if (c.timer <= 0) {
+            c.state = 'falling';
+            c.fallVelocity = 0;
+          }
+        } else if (c.state === 'falling') {
+          c.fallVelocity += 24.0 * dt;
+          c.mesh.position.y -= c.fallVelocity * dt;
+          if (c.mesh.position.y < -30) {
+            islandGroup.remove(c.mesh);
+          }
+        }
+      });
+
+      // 5. Star Shard Pickup & Magnet Physics
+      activeStars.forEach(s => {
+        if (!s.collected) {
+          s.mesh.rotation.y += 2.0 * dt;
+
+          // Magnet Attraction
+          if (magnetTimer > 0) {
+            const dist = marble.pos.distanceTo(s.pos);
+            if (dist < 14.0) {
+              const pullDir = SCRATCH_VEC2.subVectors(marble.pos, s.pos).normalize();
+              s.pos.addScaledVector(pullDir, 11.0 * dt);
+              s.mesh.position.copy(s.pos);
+            }
+          }
+
+          // Collection Collision
+          if (marble.pos.distanceTo(s.pos) < marble.radius + 0.6) {
+            s.collected = true;
+            islandGroup.remove(s.mesh);
+            starsCollected++;
+            audio.playStar();
+            updateHudStars(s.idx);
+          }
+        }
+      });
+
+      // 6. Active Pickups (Time Shards, Magnet, Checkpoints)
+      activePickups.forEach(p => {
+        if (!p.collected) {
+          p.mesh.rotation.y += 1.8 * dt;
+
+          if (marble.pos.distanceTo(p.pos) < marble.radius + 0.65) {
+            p.collected = true;
+            if (p.type === 'timeShard') {
+              slowMoTimer = 3.0;
+              islandGroup.remove(p.mesh);
+              audio.playSlowMo();
+              showPillAlert('alert-slowmo', 3000);
+            } else if (p.type === 'magnet') {
+              magnetTimer = 6.0;
+              islandGroup.remove(p.mesh);
+              audio.playMagnet();
+              showPillAlert('alert-magnet', 6000);
+            } else if (p.type === 'checkpoint') {
+              marble.checkpointPos.copy(p.pos);
+              marble.checkpointPos.y += 0.8;
+              p.mesh.material.color.setHex(0x2ecc71);
+              p.mesh.material.emissive.setHex(0x115522);
+              audio.playCheckpoint();
+              showPillAlert('alert-checkpoint', 2000);
+            }
+          }
+        }
+      });
+
+      // 7. Check Fall Condition
+      if (marble.pos.y < -12.0 && !marble.hasFallen) {
+        marble.hasFallen = true;
+        audio.playFall();
+        setTimeout(() => {
+          marble.pos.copy(marble.checkpointPos);
+          marble.vel.set(0, 0, 0);
+          marble.hasFallen = false;
+        }, 500);
+      }
+
+      // 8. Goal Reached Check
+      const goalDist = SCRATCH_VEC2.set(marble.pos.x - goalMesh.position.x, 0, marble.pos.z - goalMesh.position.z).length();
+      if (goalDist < 1.15 && Math.abs(marble.pos.y - goalMesh.position.y) < 1.0) {
+        levelComplete();
+      }
+
+      // 9. Update Sound & Particle Trail
+      const speed = marble.vel.length();
+      audio.updateRolling(speed, marble.isGrounded);
+
+      if (!settings.potatoMode && speed > 0.4 && marble.isGrounded) {
+        trailTimer += dt;
+        if (trailTimer > 0.04) {
+          trailTimer = 0;
+          trailPositions[trailHead * 3 + 0] = marble.pos.x;
+          trailPositions[trailHead * 3 + 1] = marble.pos.y - marble.radius + 0.05;
+          trailPositions[trailHead * 3 + 2] = marble.pos.z;
+          trailHead = (trailHead + 1) % TRAIL_COUNT;
+          trailGeom.attributes.position.needsUpdate = true;
+        }
+      }
+
+      // 10. Record Replay Keyframes (10 Hz)
+      recordTimer += dt;
+      if (recordTimer >= 0.1) {
+        recordTimer -= 0.1;
+        recordedKeyframes.push([
+          parseFloat(levelTimer.toFixed(2)),
+          parseFloat(marble.pos.x.toFixed(2)),
+          parseFloat(marble.pos.y.toFixed(2)),
+          parseFloat(marble.pos.z.toFixed(2))
+        ]);
+      }
+
+      // 11. Ghost Replay Playback
+      if (ghostRunData && ghostMesh.visible) {
+        ghostPlaybackTimer += dt;
+        const kfs = ghostRunData.keyframes;
+        const idx = Math.floor(ghostPlaybackTimer * 10);
+        if (idx < kfs.length) {
+          ghostMesh.position.set(kfs[idx][1], kfs[idx][2], kfs[idx][3]);
+        }
+      }
+
+      // Update Visual Marble Mesh
+      marbleMesh.position.copy(marble.pos);
+      // Rolling ball rotation along velocity
+      if (speed > 0.01) {
+        const rollAxis = SCRATCH_VEC3.set(marble.vel.z, 0, -marble.vel.x).normalize();
+        const rollAngle = (speed * dt) / marble.radius;
+        marbleMesh.rotateOnAxis(rollAxis, rollAngle);
+      }
+    }
+
+    // --- SPHERE COLLISION RESOLVERS ---
+    function resolveSphereBox(bx, by, bz, bw, bh, bd, onContactCallback) {
+      const hw = bw * 0.5;
+      const hh = bh * 0.5;
+      const hd = bd * 0.5;
+
+      const minX = bx - hw, maxX = bx + hw;
+      const minY = by - hh, maxY = by + hh;
+      const minZ = bz - hd, maxZ = bz + hd;
+
+      const cx = Math.max(minX, Math.min(maxX, marble.pos.x));
+      const cy = Math.max(minY, Math.min(maxY, marble.pos.y));
+      const cz = Math.max(minZ, Math.min(maxZ, marble.pos.z));
+
+      const dx = marble.pos.x - cx;
+      const dy = marble.pos.y - cy;
+      const dz = marble.pos.z - cz;
+      const distSq = dx * dx + dy * dy + dz * dz;
+
+      if (distSq < marble.radius * marble.radius) {
+        let dist = Math.sqrt(distSq);
+        let nx = 0, ny = 1, nz = 0;
+        let pen = 0;
+
+        if (dist > 0.0001) {
+          nx = dx / dist;
+          ny = dy / dist;
+          nz = dz / dist;
+          pen = marble.radius - dist;
+        } else {
+          // Inside box: push out along minimal face
+          const px = hw - Math.abs(marble.pos.x - bx);
+          const py = hh - Math.abs(marble.pos.y - by);
+          const pz = hd - Math.abs(marble.pos.z - bz);
+          if (py <= px && py <= pz) {
+            ny = marble.pos.y > by ? 1 : -1;
+            pen = py + marble.radius;
+          } else if (px <= pz) {
+            nx = marble.pos.x > bx ? 1 : -1;
+            pen = px + marble.radius;
+          } else {
+            nz = marble.pos.z > bz ? 1 : -1;
+            pen = pz + marble.radius;
+          }
+        }
+
+        // Push out penetration
+        marble.pos.x += nx * pen;
+        marble.pos.y += ny * pen;
+        marble.pos.z += nz * pen;
+
+        // Velocity reflection & friction
+        const vn = marble.vel.x * nx + marble.vel.y * ny + marble.vel.z * nz;
+        if (vn < 0) {
+          if (vn < -3.5) audio.playBounce(-vn);
+          marble.vel.x -= (1 + RESTITUTION) * vn * nx;
+          marble.vel.y -= (1 + RESTITUTION) * vn * ny;
+          marble.vel.z -= (1 + RESTITUTION) * vn * nz;
+
+          // Tangential friction
+          marble.vel.x *= ROLLING_FRICTION;
+          marble.vel.z *= ROLLING_FRICTION;
+        }
+
+        if (ny > 0.55) {
+          marble.isGrounded = true;
+        }
+
+        if (onContactCallback) onContactCallback();
+      }
+    }
+
+    function resolveSphereRamp(ramp) {
+      const hw = ramp.w * 0.5;
+      const hh = ramp.h;
+      const hd = ramp.d * 0.5;
+      const bx = ramp.x;
+      const by = ramp.y - hh * 0.5;
+      const bz = ramp.z;
+
+      // Check footprint
+      if (marble.pos.x < bx - hw - marble.radius || marble.pos.x > bx + hw + marble.radius ||
+          marble.pos.z < bz - hd - marble.radius || marble.pos.z > bz + hd + marble.radius) {
+        return;
+      }
+
+      let u = (ramp.dir === '+z')
+        ? (marble.pos.z - (bz - hd)) / ramp.d
+        : ((bz + hd) - marble.pos.z) / ramp.d;
+
+      u = Math.max(0, Math.min(1, u));
+      const surfaceY = by + u * hh;
+
+      const hyp = Math.sqrt(ramp.d * ramp.d + hh * hh);
+      const ny = ramp.d / hyp;
+      const nz = (ramp.dir === '+z' ? -hh : hh) / hyp;
+
+      const dy = marble.pos.y - surfaceY;
+      const dist = dy * ny; // Projected normal distance
+
+      if (dist < marble.radius && dist > -marble.radius) {
+        const pen = marble.radius - dist;
+        marble.pos.y += ny * pen;
+        marble.pos.z += nz * pen;
+
+        const vn = marble.vel.y * ny + marble.vel.z * nz;
+        if (vn < 0) {
+          marble.vel.y -= (1 + RESTITUTION) * vn * ny;
+          marble.vel.z -= (1 + RESTITUTION) * vn * nz;
+          marble.vel.x *= ROLLING_FRICTION;
+        }
+        marble.isGrounded = true;
+      }
+    }
+
+    function resolveSphereSpinningBar(h) {
+      // Rotate marble into bar's local frame
+      const angle = -h.mesh.rotation.y;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+
+      const relX = marble.pos.x - h.x;
+      const relZ = marble.pos.z - h.z;
+
+      const localX = relX * cosA - relZ * sinA;
+      const localZ = relX * sinA + relZ * cosA;
+
+      const hw = h.length * 0.5;
+      const hh = h.height * 0.5;
+      const hd = 0.25;
+
+      const cx = Math.max(-hw, Math.min(hw, localX));
+      const cy = Math.max(-hh, Math.min(hh, marble.pos.y - h.y));
+      const cz = Math.max(-hd, Math.min(hd, localZ));
+
+      const dx = localX - cx;
+      const dy = (marble.pos.y - h.y) - cy;
+      const dz = localZ - cz;
+      const distSq = dx * dx + dy * dy + dz * dz;
+
+      if (distSq < marble.radius * marble.radius) {
+        // Hit spinning bar! Apply tangential impulse
+        const dist = Math.max(0.001, Math.sqrt(distSq));
+        const lnx = dx / dist;
+        const lnz = dz / dist;
+
+        // Rotate normal back to world
+        const wnx = lnx * Math.cos(-angle) - lnz * Math.sin(-angle);
+        const wnz = lnx * Math.sin(-angle) + lnz * Math.cos(-angle);
+
+        marble.pos.x += wnx * (marble.radius - dist + 0.05);
+        marble.pos.z += wnz * (marble.radius - dist + 0.05);
+
+        // Impart angular speed swat
+        const armDist = Math.sqrt(relX * relX + relZ * relZ);
+        const swatSpeed = armDist * Math.abs(h.speed) * 1.6;
+        marble.vel.x += wnx * swatSpeed;
+        marble.vel.z += wnz * swatSpeed;
+        audio.playBounce(swatSpeed);
+      }
+    }
+
+    // --- LEVEL COMPLETE / VICTORY LOGIC ---
+    function levelComplete() {
+      if (!gameRunning) return;
+      gameRunning = false;
+      audio.playWin();
+
+      const timeTaken = levelTimer;
+      const runData = {
+        levelId: currentLevelData.id,
+        stars: starsCollected,
+        time: parseFloat(timeTaken.toFixed(2)),
+        keyframes: recordedKeyframes
+      };
+
+      // Save Best Run & Generate Share Ghost Code
+      MultiplayerAPI.saveRun(currentLevelData.id, runData);
+      const ghostCode = MultiplayerAPI.encodeGhost(runData);
+
+      // Populate Victory Modal
+      document.getElementById('victory-time-text').textContent = formatTime(timeTaken);
+      const isGold = timeTaken <= currentLevelData.goldTime && starsCollected === 3;
+      const isSilver = timeTaken <= currentLevelData.parTime && starsCollected >= 2;
+      const medalText = isGold ? '🏆 GOLD MEDAL' : (isSilver ? '🥈 SILVER MEDAL' : '🥉 BRONZE MEDAL');
+      document.getElementById('victory-medal-text').textContent = medalText;
+
+      for (let i = 0; i < 3; i++) {
+        const starEl = document.getElementById(`v-star-${i}`);
+        starEl.classList.toggle('awarded', i < starsCollected);
+      }
+
+      document.getElementById('victory-ghost-code').value = ghostCode;
+      openModal('modal-victory');
+    }
+
+    // --- HUD HELPERS ---
+    function formatTime(s) {
+      const mins = Math.floor(s / 60);
+      const secs = (s % 60).toFixed(2);
+      return `${String(mins).padStart(2, '0')}:${secs.padStart(5, '0')}`;
+    }
+
+    function resetHudStars() {
+      for (let i = 0; i < 3; i++) {
+        document.getElementById(`hud-star-${i}`).classList.remove('collected');
+      }
+    }
+
+    function updateHudStars(idx) {
+      const el = document.getElementById(`hud-star-${idx}`);
+      if (el) el.classList.add('collected');
+    }
+
+    function showPillAlert(id, durationMs) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.classList.add('visible');
+      setTimeout(() => el.classList.remove('visible'), durationMs);
+    }
+
+    // --- MODAL CONTROLLERS & LEVEL SELECT BUILDER ---
+    function openModal(id) {
+      const modal = document.getElementById(id);
+      if (modal) modal.classList.add('active');
+    }
+
+    function closeModal(id) {
+      const modal = document.getElementById(id);
+      if (modal) modal.classList.remove('active');
+    }
+
+    function closeAllModals() {
+      document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
+    }
+
+    function toggleModal(id) {
+      const modal = document.getElementById(id);
+      if (!modal) return;
+      if (modal.classList.contains('active')) {
+        closeModal(id);
+      } else {
+        closeAllModals();
+        openModal(id);
+        if (id === 'modal-levels') renderLevelGrid();
+      }
+    }
+
+    function renderLevelGrid() {
+      const grid = document.getElementById('level-grid-container');
+      grid.innerHTML = '';
+
+      LEVELS.forEach((lvl, idx) => {
+        const card = document.createElement('div');
+        card.className = `level-card ${currentLevelIdx === idx ? 'active' : ''}`;
+        
+        let starsSvg = '';
+        const saved = localStorage.getItem(`tilt_best_${lvl.id}`);
+        const parsed = saved ? JSON.parse(saved) : null;
+        const savedStars = parsed ? parsed.stars : 0;
+        const bestTime = parsed ? formatTime(parsed.time) : '--:--';
+
+        for (let s = 0; s < 3; s++) {
+          starsSvg += `<svg class="${s < savedStars ? 'earned' : ''}" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>`;
+        }
+
+        card.innerHTML = `
+          <div class="num">${lvl.id}</div>
+          <div style="font-size:11px; font-weight:700; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; width:100%;">${lvl.title}</div>
+          <div class="stars">${starsSvg}</div>
+          <div class="best-time">${bestTime}</div>
+        `;
+
+        card.onclick = () => {
+          loadLevel(idx);
+          closeModal('modal-levels');
+        };
+        grid.appendChild(card);
+      });
+    }
+
+    // Modal Close Buttons
+    document.querySelectorAll('.modal-close').forEach(btn => {
+      btn.onclick = () => closeModal(btn.getAttribute('data-modal'));
+    });
+
+    document.getElementById('btn-restart').onclick = restartLevel;
+    document.getElementById('btn-levels').onclick = () => toggleModal('modal-levels');
+    document.getElementById('btn-settings').onclick = () => toggleModal('modal-settings');
+    document.getElementById('btn-duel').onclick = () => toggleModal('modal-duel');
+    document.getElementById('btn-victory-replay').onclick = restartLevel;
+
+    document.getElementById('btn-victory-next').onclick = () => {
+      closeModal('modal-victory');
+      if (currentLevelIdx < LEVELS.length - 1) {
+        loadLevel(currentLevelIdx + 1);
+      } else {
+        toggleModal('modal-levels');
+      }
+    };
+
+    document.getElementById('btn-copy-ghost').onclick = () => {
+      const input = document.getElementById('victory-ghost-code');
+      input.select();
+      navigator.clipboard.writeText(input.value);
+      document.getElementById('btn-copy-ghost').textContent = 'Copied!';
+      setTimeout(() => document.getElementById('btn-copy-ghost').textContent = 'Copy', 1800);
+    };
+
+    // Daily Island Handler
+    const todayStr = new Date().toISOString().slice(0, 10);
+    document.getElementById('daily-island-date-label').textContent = `Seeded Challenge for ${todayStr}`;
+    document.getElementById('btn-select-daily').onclick = () => {
+      const dailyData = generateDailyIsland(todayStr);
+      loadLevel(dailyData);
+      closeModal('modal-levels');
+    };
+
+    // Mute Audio Toggle
+    function toggleMute() {
+      audio.ensureActive();
+      audio.setMute(!audio.isMuted);
+      document.getElementById('audio-icon-on').style.display = audio.isMuted ? 'none' : 'block';
+      document.getElementById('audio-icon-off').style.display = audio.isMuted ? 'block' : 'none';
+    }
+    document.getElementById('btn-audio').onclick = toggleMute;
+
+    // Settings Controls
+    document.getElementById('opt-resolution').onchange = (e) => {
+      settings.renderScale = parseFloat(e.target.value);
+      applyQualitySettings();
+    };
+
+    document.getElementById('opt-potato').onchange = (e) => {
+      settings.potatoMode = e.target.checked;
+      applyQualitySettings();
+    };
+
+    document.getElementById('opt-controls').onchange = (e) => {
+      settings.controlMode = e.target.value;
+      if (settings.controlMode === 'gyro' && typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().catch(() => {});
+      }
+    };
+
+    document.getElementById('opt-volume').oninput = (e) => {
+      audio.ensureActive();
+      audio.setVolume(parseFloat(e.target.value));
+    };
+
+    document.getElementById('btn-import-ghost').onclick = () => {
+      const code = document.getElementById('input-import-ghost').value.trim();
+      const ghost = MultiplayerAPI.decodeGhost(code);
+      if (ghost && ghost.keyframes.length > 0) {
+        ghostRunData = ghost;
+        ghostPlaybackTimer = 0;
+        ghostMesh.visible = true;
+        alert(`Loaded ghost run! Time: ${ghost.time}s, Stars: ${ghost.stars}`);
+        closeModal('modal-settings');
+      } else {
+        alert('Invalid ghost replay code.');
+      }
+    };
+
+    function applyQualitySettings() {
+      const w = window.innerWidth * (settings.potatoMode ? 0.5 : settings.renderScale);
+      const h = window.innerHeight * (settings.potatoMode ? 0.5 : settings.renderScale);
+      renderer.setSize(w, h, false);
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      scene.fog = settings.potatoMode ? null : new THREE.FogExp2(0x1c182b, 0.012);
+      trailPoints.visible = !settings.potatoMode;
+    }
+
+    // --- WEBRTC DUEL MODAL TAB CONTROLS ---
+    document.getElementById('tab-duel-host').onclick = () => showDuelTab('host');
+    document.getElementById('tab-duel-join').onclick = () => showDuelTab('join');
+    document.getElementById('tab-duel-local').onclick = () => showDuelTab('local');
+
+    function showDuelTab(tab) {
+      document.querySelectorAll('.duel-tab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('pane-duel-host').style.display = tab === 'host' ? 'flex' : 'none';
+      document.getElementById('pane-duel-join').style.display = tab === 'join' ? 'flex' : 'none';
+      document.getElementById('pane-duel-local').style.display = tab === 'local' ? 'flex' : 'none';
+      if (tab === 'host') document.getElementById('tab-duel-host').classList.add('active');
+      if (tab === 'join') document.getElementById('tab-duel-join').classList.add('active');
+      if (tab === 'local') document.getElementById('tab-duel-local').classList.add('active');
+    }
+
+    // WebRTC Host Flow
+    document.getElementById('btn-webrtc-create-offer').onclick = async () => {
+      DuelManager.initPeer(true);
+      const offer = await DuelManager.peer.createOffer();
+      await DuelManager.peer.setLocalDescription(offer);
+
+      DuelManager.peer.onicecandidate = () => {
+        if (!DuelManager.peer.iceGatheringState || DuelManager.peer.iceGatheringState === 'complete') {
+          const offerStr = btoa(JSON.stringify(DuelManager.peer.localDescription));
+          document.getElementById('webrtc-offer-out').value = offerStr;
+        }
+      };
+    };
+
+    document.getElementById('btn-webrtc-copy-offer').onclick = () => {
+      const area = document.getElementById('webrtc-offer-out');
+      area.select();
+      navigator.clipboard.writeText(area.value);
+    };
+
+    document.getElementById('btn-webrtc-connect').onclick = async () => {
+      const ansStr = document.getElementById('webrtc-answer-in').value.trim();
+      if (!ansStr) return;
+      const desc = JSON.parse(atob(ansStr));
+      await DuelManager.peer.setRemoteDescription(desc);
+    };
+
+    // WebRTC Join Flow
+    document.getElementById('btn-webrtc-create-answer').onclick = async () => {
+      const offStr = document.getElementById('webrtc-offer-in').value.trim();
+      if (!offStr) return;
+      DuelManager.initPeer(false);
+      const desc = JSON.parse(atob(offStr));
+      await DuelManager.peer.setRemoteDescription(desc);
+      const answer = await DuelManager.peer.createAnswer();
+      await DuelManager.peer.setLocalDescription(answer);
+
+      DuelManager.peer.onicecandidate = () => {
+        if (!DuelManager.peer.iceGatheringState || DuelManager.peer.iceGatheringState === 'complete') {
+          const ansStr = btoa(JSON.stringify(DuelManager.peer.localDescription));
+          document.getElementById('webrtc-answer-out').value = ansStr;
+        }
+      };
+    };
+
+    document.getElementById('btn-webrtc-copy-answer').onclick = () => {
+      const area = document.getElementById('webrtc-answer-out');
+      area.select();
+      navigator.clipboard.writeText(area.value);
+    };
+
+    // Local Split-Axis Practice Toggle
+    document.getElementById('btn-toggle-local-duel').onclick = () => {
+      DuelManager.localSplitMode = !DuelManager.localSplitMode;
+      const btn = document.getElementById('btn-toggle-local-duel');
+      const st = document.getElementById('webrtc-status');
+      if (DuelManager.localSplitMode) {
+        btn.textContent = 'Disable Local Split Mode';
+        btn.classList.add('btn-secondary');
+        btn.classList.remove('btn-primary');
+        st.textContent = 'Active: Local Split-Axis (P1: A/D, P2: W/S or Arrows)';
+      } else {
+        btn.textContent = 'Enable Local Split-Axis Mode';
+        btn.classList.add('btn-primary');
+        btn.classList.remove('btn-secondary');
+        st.textContent = 'Status: Standalone Mode';
+      }
+    };
+
+    // --- MAIN RENDER LOOP & ACCUMULATOR ---
+    let accumulator = 0;
+    let lastTimestamp = performance.now();
+
+    function mainLoop(currentTimestamp) {
+      // Pause simulation when tab is hidden
+      if (document.hidden) {
+        lastTimestamp = currentTimestamp;
+        requestAnimationFrame(mainLoop);
+        return;
+      }
+
+      let frameTime = (currentTimestamp - lastTimestamp) / 1000.0;
+      lastTimestamp = currentTimestamp;
+      if (frameTime > 0.1) frameTime = 0.1; // Spiral-of-death guard
+
+      // Slow-Motion Power-Up Time Scaling
+      let effectiveDt = frameTime;
+      if (slowMoTimer > 0) {
+        slowMoTimer -= frameTime;
+        effectiveDt *= 0.35; // 35% time slow-mo
+      }
+      if (magnetTimer > 0) {
+        magnetTimer -= frameTime;
+      }
+
+      accumulator += effectiveDt;
+      while (accumulator >= FIXED_DT) {
+        physicsStep(FIXED_DT);
+        if (gameRunning) {
+          levelTimer += FIXED_DT;
+          document.getElementById('hud-timer').textContent = formatTime(levelTimer);
+        }
+        accumulator -= FIXED_DT;
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(mainLoop);
+    }
+
+    // Window Resize Handler
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      applyQualitySettings();
+    });
+
+    // --- BOOTSTRAP GAME ---
+    applyQualitySettings();
+    loadLevel(0);
+    requestAnimationFrame(mainLoop);
+  </script>
+</body>
+</html>
